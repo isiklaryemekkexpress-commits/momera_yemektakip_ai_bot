@@ -50,8 +50,24 @@ else:
     USE_VERTEX = GEMINI_API_KEY.startswith("AQ.")
 
 logger.info("Gemini modu: %s", "Vertex AI" if USE_VERTEX else "Gemini API")
-client = genai.Client(vertexai=USE_VERTEX, api_key=GEMINI_API_KEY)
+import json
+from google.oauth2 import service_account
 
+_creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+if _creds_json:
+    _info = json.loads(_creds_json)
+    _creds = service_account.Credentials.from_service_account_info(
+        _info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    client = genai.Client(
+        vertexai=True,
+        credentials=_creds,
+        project=_info["project_id"],
+        location="us-central1",
+    )
+    logger.info("Gemini modu: Vertex AI (service account)")
+else:
+    client = genai.Client(vertexai=USE_VERTEX, api_key=GEMINI_API_KEY)
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     """Telegram 4096 karakter sınırı için uzun yanıtları parçalara böler."""
