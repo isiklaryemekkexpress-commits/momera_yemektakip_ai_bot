@@ -122,7 +122,13 @@ async def izinli_mi(update: Update) -> bool:
 
 # ------------------------------------------------------------------- Groq
 async def groq_chat(messages: list[dict], model: str, json_mode: bool = False) -> str:
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        # Ücretsiz katmanda dakikada 1000 çıktı tokenı sınırı var; isteği buna göre kısıtla.
+        "max_completion_tokens": 900 if json_mode else 500,
+    }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=120) as http:
