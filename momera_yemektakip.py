@@ -12,7 +12,7 @@ logging.basicConfig(
 
 # Bot Token ve Gemini API Anahtarınız
 TELEGRAM_BOT_TOKEN = "9232669675:AAEH1x_CVSRIdCusgMLuBryIBeaMWhtSxyo"
-GEMINI_API_KEY = "AQ.Ab8RN6Ko4D8cFoGicVFxeStXEQoh_h1Q0XV9oEIPcIRkznoDVQ"
+GEMINI_API_KEY = "AQ.Ab8RN6II7TfR1atxdWaMHmz2a7JKYrDoUpwtXvdSUt1mEhQ8Pg"
 
 # Gemini İstemcisi
 client = genai.Client(api_key=GEMINI_API_KEY)
