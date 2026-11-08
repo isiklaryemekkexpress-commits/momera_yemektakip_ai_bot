@@ -65,9 +65,10 @@ BASE_SYSTEM_PROMPT = (
     "Sen Momera Yemek Takip yapay zeka asistanısın. "
     "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver. "
     f"Bir Google Sheets tablosuna ('{SHEET_NAME}') bağlısın: tablonun içeriğini okuyabilir, "
-    "sorulara tablodaki verilere dayanarak cevap verebilir ve fotoğraftaki bilgileri "
-    "kullanıcı onayıyla tabloya satır olarak ekleyebilirsin. "
-    "Tablodaki mevcut veriyi değiştiremez ya da silemezsin."
+    "sorulara tablodaki verilere dayanarak cevap verebilir, fotoğraftaki bilgileri tabloya "
+    "satır olarak ekleyebilir ve kullanıcı isterse tabloya yazı yazabilirsin. "
+    "Her yazma işlemi izin kurallarına ve çoğunlukla kullanıcı onayına tabidir. "
+    "Satır ya da veri silemezsin."
 )
 
 
@@ -95,6 +96,87 @@ EXTRACT_PROMPT = (
     "Okuyamadığın veya emin olmadığın değeri boş bırak, asla tahmin etme ya da uydurma. "
     "Kullanıcı açıklama yazdıysa ona göre davran."
 )
+
+
+# ------------------------------------------------------------ Yazma izinleri
+def _norm(s) -> str:
+    """Türkçe karakterleri sadeleştirip küçük harfe çevirir (karşılaştırma için)."""
+    return str(s).strip().translate(str.maketrans("ıİşŞğĞüÜöÖçÇ", "iissgguuoocc")).lower()
+
+
+def _liste(value: str) -> list[str]:
+    return [x.strip() for x in re.split(r"[,;]", value) if x.strip()]
+
+
+def _bos_mu(value: str) -> bool:
+    return _norm(value) in ("", "yok", "hicbiri", "hepsi", "tumu", "-")
+
+
+def load_permissions(rules: str) -> dict:
+    """kurallar.md içindeki '## Yazma izinleri' bölümünü okur. Bu sınırlar kodda uygulanır."""
+    perm = {
+        "yazma": True,
+        "izinli_islemler": {"satir_ekle", "hucre_yaz"},
+        "korumali_sutunlar": set(),
+        "yazilabilir_sutunlar": set(),  # boşsa sütun kısıtı yok
+        "korumali_satirlar": {1},
+        "onay": True,
+        "en_fazla_satir": 10,
+    }
+    in_section = False
+    for raw in rules.splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            in_section = _norm(line.lstrip("# ")).startswith("yazma izinleri")
+            continue
+        if not in_section:
+            continue
+        line = line.lstrip("-* ").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = _norm(key).replace(" ", "_")
+        value = value.strip()
+        if key == "yazma":
+            perm["yazma"] = _norm(value) in ("acik", "evet", "true", "on", "1")
+        elif key == "izinli_islemler":
+            perm["izinli_islemler"] = (
+                set()
+                if _norm(value) in ("yok", "hicbiri", "-")
+                else {_norm(x).replace(" ", "_") for x in _liste(value)}
+            )
+        elif key == "korumali_sutunlar":
+            perm["korumali_sutunlar"] = set() if _bos_mu(value) else {_norm(x) for x in _liste(value)}
+        elif key == "yazilabilir_sutunlar":
+            perm["yazilabilir_sutunlar"] = set() if _bos_mu(value) else {_norm(x) for x in _liste(value)}
+        elif key == "korumali_satirlar":
+            perm["korumali_satirlar"] = {int(x) for x in _liste(value) if x.isdigit()}
+        elif key == "onay":
+            perm["onay"] = _norm(value) not in ("gerekmez", "yok", "hayir", "kapali")
+        elif key == "en_fazla_satir" and value.isdigit():
+            perm["en_fazla_satir"] = max(1, int(value))
+    return perm
+
+
+PERMS = load_permissions(RULES)
+
+
+def izin_ozeti() -> str:
+    if not PERMS["yazma"]:
+        return "Yazma işlemleri kapalı; hiçbir yazma işlemi üretme."
+    parcalar = [
+        "Yazma açık",
+        "izinli işlemler: " + (", ".join(sorted(PERMS["izinli_islemler"])) or "yok"),
+        "onay: " + ("gerekli" if PERMS["onay"] else "gerekmez"),
+        f"tek seferde en fazla {PERMS['en_fazla_satir']} satır",
+    ]
+    if PERMS["korumali_sutunlar"]:
+        parcalar.append("korumalı sütunlar: " + ", ".join(sorted(PERMS["korumali_sutunlar"])))
+    if PERMS["yazilabilir_sutunlar"]:
+        parcalar.append("yalnızca şu sütunlara yazılabilir: " + ", ".join(sorted(PERMS["yazilabilir_sutunlar"])))
+    if PERMS["korumali_satirlar"]:
+        parcalar.append("korumalı satırlar: " + ", ".join(str(x) for x in sorted(PERMS["korumali_satirlar"])))
+    return "; ".join(parcalar)
 
 
 # ---------------------------------------------------------------- Yardımcılar
@@ -216,6 +298,68 @@ def _cell(value):
     return value
 
 
+CELL_RE = re.compile(r"^([A-Za-z]{1,2})([1-9][0-9]{0,3})$")
+MAX_COL = 702  # ZZ
+MAX_ROW = 5000
+
+
+def col_to_index(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def index_to_col(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _values_url(rng: str) -> str:
+    sid, title = _sheet_meta()
+    return (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/"
+        + quote(f"'{title}'!{rng}")
+    )
+
+
+def header_sync() -> list[str]:
+    r = _session_get().get(_values_url("A1:ZZ1"))
+    r.raise_for_status()
+    return (r.json().get("values") or [[]])[0]
+
+
+def read_cell_sync(cell: str) -> str:
+    r = _session_get().get(_values_url(cell))
+    r.raise_for_status()
+    values = r.json().get("values") or []
+    return str(values[0][0]) if values and values[0] else ""
+
+
+def _to_cell_value(value):
+    """Sayı gibi görünen metni sayıya çevirir; gerisini metin olarak bırakır (RAW)."""
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    if re.fullmatch(r"-?\d+[.,]\d+", text):
+        return float(text.replace(",", "."))
+    return text
+
+
+def write_cell_sync(cell: str, value) -> None:
+    r = _session_get().put(
+        _values_url(cell),
+        params={"valueInputOption": "RAW"},
+        json={"values": [[_to_cell_value(value)]]},
+    )
+    r.raise_for_status()
+
+
 def append_rows_sync(rows: list[dict]) -> int:
     """Satırları tabloya ekler; gerekirse başlık satırını ve yeni sütunları oluşturur."""
     s = _session_get()
@@ -268,7 +412,7 @@ def read_table_sync() -> str:
     if not values:
         return ""
     header, rows = values[0], values[1:]
-    head_line = "Satır\t" + "\t".join(str(h) for h in header)
+    head_line = "Satır\t" + "\t".join(f"[{index_to_col(i)}] {h}" for i, h in enumerate(header, start=1))
     numbered = [
         f"{i}\t" + "\t".join(str(c) for c in row)
         for i, row in enumerate(rows, start=2)
@@ -308,6 +452,11 @@ async def append_rows(rows: list[dict]) -> int:
     return n
 
 
+async def write_cell(cell: str, value) -> None:
+    await asyncio.to_thread(write_cell_sync, cell, value)
+    _table_cache["t"] = 0.0
+
+
 # --------------------------------------------------------- Telegram işleyicileri
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start komutu verildiğinde çalışır."""
@@ -320,8 +469,133 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def dogrula(action: dict) -> tuple[dict | None, str]:
+    """İşlemi kurallar.md'deki izinlere göre denetler. (temiz_işlem, hata_mesajı) döndürür."""
+    if not PERMS["yazma"]:
+        return None, "Yazma işlemleri şu an kapalı (kurallar.md)."
+    tip = _norm(action.get("tip", "")).replace(" ", "_")
+    if tip not in PERMS["izinli_islemler"]:
+        return None, f"'{action.get('tip')}' işlemine izin verilmiyor (kurallar.md)."
+
+    if tip == "satir_ekle":
+        rows = [r for r in action.get("satirlar", []) if isinstance(r, dict) and r]
+        if not rows:
+            return None, "Eklenecek bir satır bulunamadı."
+        if len(rows) > PERMS["en_fazla_satir"]:
+            return None, f"Tek seferde en fazla {PERMS['en_fazla_satir']} satır eklenebilir."
+        izinsiz = set()
+        for row in rows:
+            for k in row:
+                kn = _norm(k)
+                if kn in PERMS["korumali_sutunlar"] or (
+                    PERMS["yazilabilir_sutunlar"] and kn not in PERMS["yazilabilir_sutunlar"]
+                ):
+                    izinsiz.add(str(k))
+        if izinsiz:
+            return None, "Şu sütunlara yazma izni yok: " + ", ".join(sorted(izinsiz))
+        return {"tip": "satir_ekle", "satirlar": rows}, ""
+
+    if tip == "hucre_yaz":
+        m = CELL_RE.match(str(action.get("hucre", "")).strip())
+        if not m:
+            return None, "Hücre adı geçersiz. Örnek: A2"
+        col, row = m.group(1).upper(), int(m.group(2))
+        if col_to_index(col) > MAX_COL or row > MAX_ROW:
+            return None, "Bu hücreye yazılamaz."
+        if row in PERMS["korumali_satirlar"]:
+            return None, f"{row}. satır korumalı, değiştirilemez (kurallar.md)."
+        deger = action.get("deger")
+        if isinstance(deger, (dict, list)) or deger is None or len(str(deger)) > 500:
+            return None, "Yazılacak değer geçersiz."
+        ihtiyac_var = bool(PERMS["korumali_sutunlar"] or PERMS["yazilabilir_sutunlar"])
+        header_adi = ""
+        try:
+            header = await asyncio.to_thread(header_sync)
+            idx = col_to_index(col)
+            header_adi = str(header[idx - 1]) if idx - 1 < len(header) else ""
+        except Exception:
+            logger.exception("Başlık satırı okunamadı")
+            if ihtiyac_var:
+                return None, "Tablo okunamadığı için sütun izni denetlenemedi; işlem yapılmadı."
+        kimlikler = {_norm(col)} | ({_norm(header_adi)} if header_adi else set())
+        if kimlikler & PERMS["korumali_sutunlar"]:
+            return None, f"{col} sütunu korumalı, değiştirilemez (kurallar.md)."
+        if PERMS["yazilabilir_sutunlar"] and not (kimlikler & PERMS["yazilabilir_sutunlar"]):
+            return None, f"{col} sütununa yazma izni yok (kurallar.md)."
+        try:
+            eski = await asyncio.to_thread(read_cell_sync, f"{col}{row}")
+        except Exception:
+            eski = ""
+        return {"tip": "hucre_yaz", "hucre": f"{col}{row}", "deger": deger, "eski": eski}, ""
+
+    return None, "Bu işlem desteklenmiyor."
+
+
+def _satir_onizleme(rows: list[dict]) -> str:
+    lines = []
+    for i, row in enumerate(rows, 1):
+        alanlar = "; ".join(f"{k}: {v}" for k, v in row.items() if v not in (None, ""))
+        lines.append(f"{i}. {alanlar or '(boş satır)'}")
+    return "\n".join(lines)
+
+
+def _onizleme(action: dict) -> str:
+    if action["tip"] == "satir_ekle":
+        return "Tabloya eklenecek satırlar:\n" + _satir_onizleme(action["satirlar"])
+    return (
+        f"{action['hucre']} hücresi değiştirilecek.\n"
+        f"Eski değer: {action.get('eski') or '(boş)'}\n"
+        f"Yeni değer: {action['deger']}"
+    )
+
+
+async def islem_calistir(msg, action: dict) -> bool:
+    """İşlemi yeniden denetleyip uygular. Tekrar denenebilecek bir hata olursa False döner."""
+    temiz, hata = await dogrula(action)
+    if temiz is None:
+        await msg.reply_text(hata)
+        return True
+    try:
+        if temiz["tip"] == "satir_ekle":
+            n = await append_rows(temiz["satirlar"])
+            text = f"{n} satır '{SHEET_NAME}' tablosuna eklendi."
+        else:
+            await write_cell(temiz["hucre"], temiz["deger"])
+            text = f"{temiz['hucre']} hücresine '{temiz['deger']}' yazıldı."
+    except Exception:
+        logger.exception("Tabloya yazılırken hata oluştu")
+        await msg.reply_text(
+            "Tabloya yazarken hata oluştu. Biraz sonra tekrar onay düğmesine basabilirsiniz."
+        )
+        return False
+    await msg.reply_text(text)
+    return True
+
+
+async def islem_hazirla(msg, context: ContextTypes.DEFAULT_TYPE, action: dict):
+    """İşlemi denetler; izin varsa onay ister (ya da onay gerekmiyorsa doğrudan uygular)."""
+    temiz, hata = await dogrula(action)
+    if temiz is None:
+        await msg.reply_text(hata)
+        return
+    if not PERMS["onay"]:
+        await islem_calistir(msg, temiz)
+        return
+    context.user_data["bekleyen"] = temiz
+    buttons = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Evet, uygula", callback_data="onay"),
+            InlineKeyboardButton("Hayır", callback_data="iptal"),
+        ]]
+    )
+    await msg.reply_text(
+        (_onizleme(temiz) + "\n\nOnaylıyor musunuz?")[:TELEGRAM_MAX_LEN],
+        reply_markup=buttons,
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Yazılı mesajı Groq'a iletir ve yanıtı döner."""
+    """Yazılı mesajı Groq'a iletir; cevabı gösterir, gerekirse yazma işlemini hazırlar."""
     if not await izinli_mi(update):
         return
     user_text = update.message.text
@@ -333,7 +607,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tablo = await table_context()
         tablo_notu = (
-            "Tablonun güncel içeriği (TAB ile ayrılmış; ilk sütun tablodaki satır numarasıdır):\n" + tablo
+            "Tablonun güncel içeriği (TAB ile ayrılmış; ilk sütun tablodaki satır numarası, "
+            "sütun başlıklarındaki köşeli parantez sütun harfidir):\n" + tablo
             if tablo
             else "Tablo şu an boş."
         )
@@ -349,6 +624,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n\nTabloyla ilgili sorularda yalnızca bu veriye dayan; veride olmayan bir şeyi uydurma. "
         "Toplam ya da ortalama gibi hesapları satırları tek tek toplayarak dikkatle yap. "
         "Verinin sonunda 'gösterilmiyor' notu varsa, hesabın yalnızca gösterilen satırlara ait olduğunu açıkça belirt."
+        "\n\nYanıtını YALNIZCA geçerli bir JSON nesnesi olarak ver: "
+        '{"cevap": "kullanıcıya gösterilecek metin", "islem": null}. '
+        "Kullanıcı tabloya bir şey yazmak istediğinde islem alanını doldur: "
+        'yeni satır için {"tip": "satir_ekle", "satirlar": [{"Sütun adı": "değer"}]}; '
+        'tek bir hücreyi değiştirmek için {"tip": "hucre_yaz", "hucre": "A2", "deger": "değer"}. '
+        "Yalnızca kullanıcı açıkça isterse islem üret; soru sorulduğunda islem null olsun. "
+        "Silme gibi desteklenmeyen işlemlerde islem null olsun ve cevapta bunu yapamadığını söyle. "
+        "cevap alanına işlemi yaptığını yazma; ne yapılacağını kısaca özetle, onayı sistem ister. "
+        "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
     messages = (
         [{"role": "system", "content": sistem}]
@@ -356,28 +640,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + [{"role": "user", "content": user_text}]
     )
     try:
-        reply_text = await groq_chat(messages, GROQ_MODEL) or "Bir yanıt üretilemedi."
+        raw = await groq_chat(messages, GROQ_MODEL, json_mode=True)
     except Exception:
         logger.exception("Groq çağrısında hata oluştu")
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
+    try:
+        data = parse_json(raw)
+        cevap = str(data.get("cevap") or "").strip()
+        islem = data.get("islem")
+    except Exception:
+        cevap, islem = raw.strip(), None
+    cevap = cevap or ("Bir yanıt üretilemedi." if not isinstance(islem, dict) else "")
+
     history += [
         {"role": "user", "content": user_text},
-        {"role": "assistant", "content": reply_text},
+        {"role": "assistant", "content": cevap or "(işlem hazırlandı)"},
     ]
     del history[:-HISTORY_LIMIT]
 
-    for part in split_text(reply_text):
+    for part in split_text(cevap) if cevap else []:
         await update.message.reply_text(part)
-
-
-def _satir_onizleme(rows: list[dict]) -> str:
-    lines = []
-    for i, row in enumerate(rows, 1):
-        alanlar = "; ".join(f"{k}: {v}" for k, v in row.items() if v not in (None, ""))
-        lines.append(f"{i}. {alanlar or '(boş satır)'}")
-    return "\n".join(lines)
+    if isinstance(islem, dict) and islem:
+        await islem_hazirla(update.message, context, islem)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +671,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await izinli_mi(update):
         return
     msg = update.message
+    if not PERMS["yazma"] or "satir_ekle" not in PERMS["izinli_islemler"]:
+        await msg.reply_text("Fotoğraftan tabloya ekleme şu an kapalı (kurallar.md).")
+        return
     if msg.photo:
         tg_file = await msg.photo[-1].get_file()
         mime = "image/jpeg"
@@ -431,18 +720,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    context.user_data["bekleyen"] = rows
-    buttons = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Evet, ekle", callback_data="ekle"),
-            InlineKeyboardButton("Hayır", callback_data="iptal"),
-        ]]
-    )
-    text = (
-        f"{result.get('ozet', 'Fotoğrafı okudum.')}\n\n"
-        f"{_satir_onizleme(rows)}\n\nBu satırları tabloya ekleyeyim mi?"
-    )
-    await msg.reply_text(text[:TELEGRAM_MAX_LEN], reply_markup=buttons)
+    if result.get("ozet"):
+        await msg.reply_text(str(result["ozet"])[:TELEGRAM_MAX_LEN])
+    await islem_hazirla(msg, context, {"tip": "satir_ekle", "satirlar": rows})
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,24 +732,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Yetkiniz yok.", show_alert=True)
         return
     await query.answer()
-    rows = context.user_data.pop("bekleyen", None)
-    if query.data == "iptal" or not rows:
+    action = context.user_data.pop("bekleyen", None)
+    if query.data == "iptal" or not action:
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            "Tamam, eklemedim." if query.data == "iptal" else "Bekleyen kayıt yok."
-        )
-        return
-    try:
-        n = await append_rows(rows)
-    except Exception:
-        logger.exception("Tabloya yazılırken hata oluştu")
-        context.user_data["bekleyen"] = rows  # tekrar denenebilsin
-        await query.message.reply_text(
-            "Tabloya yazarken hata oluştu. Biraz sonra tekrar 'Evet, ekle' düğmesine basabilirsiniz."
+            "Tamam, yapmadım." if query.data == "iptal" else "Bekleyen işlem yok."
         )
         return
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(f"{n} satır '{SHEET_NAME}' tablosuna eklendi.")
+    if not await islem_calistir(query.message, action):
+        context.user_data["bekleyen"] = action  # tekrar denenebilsin
 
 
 def main():
@@ -480,13 +752,14 @@ def main():
     if missing:
         logger.warning("Eksik ortam değişkenleri: %s", ", ".join(missing))
     logger.info("Groq modeli: %s | Resim modeli: %s", GROQ_MODEL, GROQ_VISION_MODEL)
+    logger.info("Yazma izinleri: %s", izin_ozeti())
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_button, pattern="^(ekle|iptal)$"))
+    app.add_handler(CallbackQueryHandler(handle_button, pattern="^(onay|iptal)$"))
 
     if RENDER_EXTERNAL_URL:
         # Render (Web Service): webhook modu, Render'ın verdiği PORT'u dinler
