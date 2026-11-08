@@ -22,13 +22,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Ayarlar (Render > Environment sekmesinden gelir, koda yazılmaz) ---
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+# --- Ayarlar ---
+# Önce Render > Environment değişkenlerine bakar; yoksa aşağıdaki tırnakların içine yazdığın değeri kullanır.
+# DİKKAT: Anahtarları dosyaya yazıp GitHub'a yüklersen herkese açık olur (özellikle public repo'da).
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or "BURAYA_TELEGRAM_TOKEN"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or "BURAYA_GEMINI_ANAHTARI"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
 PORT = int(os.environ.get("PORT", "10000"))
-# Render bu değişkeni otomatik verir (ör. https://momera-bot.onrender.com)
+# Render bu değişkeni otomatik verir (ör. https://momera-yemektakip-ai-bot.onrender.com)
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 SYSTEM_PROMPT = (
@@ -39,7 +41,16 @@ SYSTEM_PROMPT = (
 TELEGRAM_MAX_LEN = 4096
 
 # --- Gemini istemcisi ---
-client = genai.Client(api_key=GEMINI_API_KEY)
+# "AQ." ile başlayan anahtarlar Vertex AI üzerinden çalışır, otomatik algılanır.
+# Gerekirse Render'da GEMINI_USE_VERTEX=true/false ile elle de belirleyebilirsin.
+_vertex_env = os.environ.get("GEMINI_USE_VERTEX", "").lower()
+if _vertex_env:
+    USE_VERTEX = _vertex_env in ("1", "true", "yes")
+else:
+    USE_VERTEX = GEMINI_API_KEY.startswith("AQ.")
+
+logger.info("Gemini modu: %s", "Vertex AI" if USE_VERTEX else "Gemini API")
+client = genai.Client(vertexai=USE_VERTEX, api_key=GEMINI_API_KEY)
 
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
