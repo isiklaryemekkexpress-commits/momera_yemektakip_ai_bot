@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -62,7 +63,11 @@ SHEETS_SCOPES = [
 
 BASE_SYSTEM_PROMPT = (
     "Sen Momera Yemek Takip yapay zeka asistanısın. "
-    "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver."
+    "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver. "
+    f"Bir Google Sheets tablosuna ('{SHEET_NAME}') bağlısın: tablonun içeriğini okuyabilir, "
+    "sorulara tablodaki verilere dayanarak cevap verebilir ve fotoğraftaki bilgileri "
+    "kullanıcı onayıyla tabloya satır olarak ekleyebilirsin. "
+    "Tablodaki mevcut veriyi değiştiremez ya da silemezsin."
 )
 
 
@@ -248,8 +253,59 @@ def append_rows_sync(rows: list[dict]) -> int:
     return len(values)
 
 
+TABLE_CONTEXT_CHARS = int(os.environ.get("TABLE_CONTEXT_CHARS", "6000"))
+_table_cache = {"t": 0.0, "text": ""}
+
+
+def read_table_sync() -> str:
+    """Tablonun içeriğini satır numaralarıyla, TAB ile ayrılmış metin olarak döndürür."""
+    s = _session_get()
+    sid, title = _sheet_meta()
+    rng = quote(f"'{title}'!A1:ZZ5000")
+    r = s.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{rng}")
+    r.raise_for_status()
+    values = r.json().get("values") or []
+    if not values:
+        return ""
+    header, rows = values[0], values[1:]
+    head_line = "Satır\t" + "\t".join(str(h) for h in header)
+    numbered = [
+        f"{i}\t" + "\t".join(str(c) for c in row)
+        for i, row in enumerate(rows, start=2)
+    ]
+    # Yer sınırı için en yeni satırlardan geriye doğru, sığdığı kadarını al.
+    budget = TABLE_CONTEXT_CHARS - len(head_line)
+    secilen = []
+    for line in reversed(numbered):
+        if budget - len(line) - 1 < 0:
+            break
+        secilen.append(line)
+        budget -= len(line) + 1
+    secilen.reverse()
+    atlanan = len(numbered) - len(secilen)
+    out = "\n".join([head_line] + secilen)
+    if atlanan > 0:
+        out += (
+            f"\n(Not: Tabloda toplam {len(numbered)} veri satırı var; "
+            f"yer sınırı nedeniyle en eski {atlanan} satır gösterilmiyor.)"
+        )
+    return out
+
+
+async def table_context() -> str:
+    """Tablo içeriğini 20 saniyelik önbellekle okur."""
+    now = time.monotonic()
+    if _table_cache["t"] and now - _table_cache["t"] < 20:
+        return _table_cache["text"]
+    text = await asyncio.to_thread(read_table_sync)
+    _table_cache.update(t=now, text=text)
+    return text
+
+
 async def append_rows(rows: list[dict]) -> int:
-    return await asyncio.to_thread(append_rows_sync, rows)
+    n = await asyncio.to_thread(append_rows_sync, rows)
+    _table_cache["t"] = 0.0  # yeni satırlar bir sonraki soruda görünsün
+    return n
 
 
 # --------------------------------------------------------- Telegram işleyicileri
@@ -274,8 +330,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
+    try:
+        tablo = await table_context()
+        tablo_notu = (
+            "Tablonun güncel içeriği (TAB ile ayrılmış; ilk sütun tablodaki satır numarasıdır):\n" + tablo
+            if tablo
+            else "Tablo şu an boş."
+        )
+    except Exception:
+        logger.exception("Tablo okunamadı")
+        tablo_notu = (
+            "Tablo şu an okunamadı. Tablo verisi gerektiren sorularda bunu söyle, tahmin etme."
+        )
+    sistem = (
+        SYSTEM_PROMPT
+        + "\n\n"
+        + tablo_notu
+        + "\n\nTabloyla ilgili sorularda yalnızca bu veriye dayan; veride olmayan bir şeyi uydurma. "
+        "Toplam ya da ortalama gibi hesapları satırları tek tek toplayarak dikkatle yap. "
+        "Verinin sonunda 'gösterilmiyor' notu varsa, hesabın yalnızca gösterilen satırlara ait olduğunu açıkça belirt."
+    )
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": sistem}]
         + history
         + [{"role": "user", "content": user_text}]
     )
