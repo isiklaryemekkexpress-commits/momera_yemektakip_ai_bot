@@ -11,7 +11,7 @@ logging.basicConfig(
 )
 
 # Bot Token ve Gemini API Anahtarınız
-TELEGRAM_BOT_TOKEN = "9232669675:AAF8E05SdQilntp_49JFV1ZyNmc4DpJN-Jo"
+TELEGRAM_BOT_TOKEN = "9232669675:AAEH1x_CVSRIdCusgMLuBryIBeaMWhtSxyo"
 GEMINI_API_KEY = "AQ.Ab8RN6Ko4D8cFoGicVFxeStXEQoh_h1Q0XV9oEIPcIRkznoDVQ"
 
 # Gemini İstemcisi
