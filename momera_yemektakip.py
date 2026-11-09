@@ -595,7 +595,12 @@ def _check_listbot_headers(current: list[list]) -> None:
 
 
 def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
-    """A:I alanına ekler, S:T'yi aynı satırlara yazar; J:R'ye ASLA yazmaz."""
+    """A sütunundaki son kaydın altına yazar; mevcut diğer hücreleri korur.
+
+    P sütunundaki açılır menü değerleri veya J:R formülleri satır seçimini
+    etkilemez. Google Sheets values.append kullanılmaz: o yöntem P sütununu
+    da tablo sınırı sayıp yanlış satıra ekleyebilir.
+    """
     if not rows:
         raise ValueError("Eklenecek satır yok.")
     s = _session_get()
@@ -605,49 +610,66 @@ def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tupl
     timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
     catalog = _product_catalog_sync()
     prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
+
+    # A sütunu esas alınır: P'deki "Dışarı" veya J:R formülleri
+    # yeni kayıt yerini değiştiremez.
     current = _values_read_sync(title, "A1:T5000")
     _check_listbot_headers(current)
+    last_a = 1
+    existing_numbers = []
+    for sheet_row, values in enumerate(current[1:], start=2):
+        if values and str(values[0]).strip():
+            last_a = sheet_row
+        if len(values) > 1 and str(values[1]).strip().isdigit():
+            existing_numbers.append(int(values[1]))
+    first = last_a + 1
+    last = first + len(prepared) - 1
+    if last > MAX_ROW:
+        raise ValueError(f"ListBot'ta {MAX_ROW}. satır sınırı aşılıyor; kayıt yapılmadı.")
 
-    existing_numbers = [
-        int(row[1]) for row in current[1:]
-        if len(row) > 1 and str(row[1]).strip().isdigit()
-    ]
+    # Hedef A:I ve S:T'de tek bir dolu hücre bile varsa üzerine yazma.
+    # J:R ise bilerek KONTROL EDİLMEZ ve DEĞİŞTİRİLMEZ;
+    # bu aralıkta mevcut formüller / P='Dışarı' korunur.
+    for sheet_row in range(first, last + 1):
+        existing = current[sheet_row - 1] if sheet_row <= len(current) else []
+        for col_index in list(range(0, 9)) + [18, 19]:
+            if col_index < len(existing) and str(existing[col_index]).strip():
+                cell = f"{index_to_col(col_index + 1)}{sheet_row}"
+                raise ValueError(
+                    f"{cell} hücresi zaten dolu. Var olan veri silinmesin diye "
+                    "hiçbir kayıt yapılmadı; tabloyu kontrol edin."
+                )
+
     next_no = max(existing_numbers, default=0) + 1
     for i, row in enumerate(prepared):
         row["No"] = next_no + i
+    input_values = [[_cell(row.get(h, "")) for h in INPUT_HEADERS] for row in prepared]
+    output_values = [[_cell(row.get(h, "")) for h in OUTPUT_HEADERS] for row in prepared]
 
-    # Önce yalnızca A:I yaz. OVERWRITE mevcut J:R formüllerini ve
-    # S:T hücrelerini korur (INSERT_ROWS tüm satırı kaydırabilir).
-    values = [[_cell(row.get(h, "")) for h in INPUT_HEADERS] for row in prepared]
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:I5000")}:append"
-    r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "OVERWRITE"},
-               json={"values": values})
-    r.raise_for_status()
-    updated = r.json().get("updates", {}).get("updatedRange", "")
-    match = re.search(r"!A(\d+):I(\d+)$", updated)
-    if not match:
-        # Veri A:I'ye yazılmış olabilir. Tekrar eklemek mükerrer kayıt oluşturur.
+    # İki aralığı tek Google Sheets values.batchUpdate isteğinde yaz.
+    # A:I ve S:T dışında hiçbir hücre güncellenmez; satır eklenmez/kaydırılmaz.
+    endpoint = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate"
+    body = {
+        "valueInputOption": "RAW",
+        "data": [
+            {"range": f"'{title}'!A{first}:I{last}", "values": input_values},
+            {"range": f"'{title}'!S{first}:T{last}", "values": output_values},
+        ],
+    }
+    try:
+        response = s.post(endpoint, json=body, timeout=60)
+        response.raise_for_status()
+    except Exception as exc:
+        # Ağ hatası olsa bile sunucu yazmış olabilir; otomatik tekrar yazma.
+        logger.exception("ListBot batchUpdate sonucu doğrulanamadı: satır %s-%s", first, last)
         raise RuntimeError(
-            "Yemekler A:I'ye eklenmiş olabilir ancak satır numarası alınamadı. "
-            "Tekrar denemeden önce ListBot'u kontrol edin."
-        )
-    first, last = map(int, match.groups())
-    if last - first + 1 != len(prepared):
-        raise RuntimeError("Eklenen satır sayısı beklenenden farklı. Tekrar denemeden önce tabloyu kontrol edin.")
+            f"Kayıt sonucu doğrulanamadı (A{first}:I{last}, S{first}:T{last}). "
+            "Tekrar onaylamadan önce Google Sheets'i kontrol edin."
+        ) from exc
 
-    # S = Eklenme Zamanı, T = Notes. J:R'ye dokunulmaz.
-    notes_values = [[_cell(row.get(h, "")) for h in OUTPUT_HEADERS] for row in prepared]
-    notes_range = f"S{first}:T{last}"
-    r = s.put(_values_url(notes_range), params={"valueInputOption": "RAW"},
-              json={"values": notes_values})
-    if r.status_code >= 400:
-        logger.error("A:I yazıldı, S:T yazılamadı. Satırlar %s-%s: %s", first, last, r.text[:500])
-        raise RuntimeError(
-            f"A:I satır {first}-{last} eklendi fakat S:T yazılamadı. "
-            "Tekrar onaylamayın; tablodaki kayıtları kontrol edin."
-        )
     marked = [str(row["Yemek Adı"]) for row in prepared
               if str(row["Yemek Adı"]).upper().endswith("-Y")]
+    logger.info("ListBot'a A sütununa göre %s-%s satırlarına %s kayıt yazıldı", first, last, len(prepared))
     return len(prepared), marked
 
 
