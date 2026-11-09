@@ -42,7 +42,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SHEET_NAME = os.environ.get("SHEET_NAME", "yemekkexpress_yemektakip_AI")
 SHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
-SHEET_TAB_NAME = "ListBot"  # Verilerin okunacağı ve yazılacağı tek sekme
+SHEET_TAB_NAME = "ListBot"  # Yalnızca bu sekmeye yazılır
+SOURCE_TAB_NAME = "Günlük Takip"  # Ürün adları C5:C ve türleri B5:B
 # Boş bırakılırsa herkes kullanabilir. Doluysa virgülle ayrılmış Telegram kullanıcı ID'leri.
 ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
@@ -89,13 +90,12 @@ SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + ("\n\nKurallar:\n" + RULES if RULES else ""
 
 EXTRACT_PROMPT = (
     SYSTEM_PROMPT
-    + "\n\nGörevin: Kullanıcının gönderdiği fotoğraftaki bilgileri tabloya eklenecek satırlara çevirmek. "
-    "Yalnızca şu biçimde geçerli bir JSON nesnesi döndür: "
-    '{"ozet": "fotoğrafın bir cümlelik özeti", "satirlar": [{"Sütun adı": "değer"}]}. '
-    "Sütun adlarını fotoğraftaki başlıklardan veya içerikten türet, Türkçe ve kısa tut. "
-    "Fotoğrafta birden fazla kalem varsa her biri ayrı satır olsun. "
-    "Okuyamadığın veya emin olmadığın değeri boş bırak, asla tahmin etme ya da uydurma. "
-    "Kullanıcı açıklama yazdıysa ona göre davran."
+    + "\n\nFotoğraftaki yemek ve miktar bilgilerini çıkar. "
+    "Yalnızca geçerli JSON ver: "
+    '{"ozet":"kısa özet","satirlar":[{"Yemek Adı":"...","Gelen Adet":"...","Satılan Adet":"...","Fire":"...","Stok":"...","Devreden":"..."}]}. '
+    "Fotoğrafta bulunmayan alanları boş bırak. Her yemek ayrı satırdır. "
+    "Yemek isimlerini tahmin ederek düzeltme; kod kaynak tablodan doğrulayacak. "
+    "Tarih, No ve Eklenme Zamanı alanlarını üretme."
 )
 
 
@@ -352,39 +352,125 @@ def write_cell_sync(cell: str, value) -> None:
     r.raise_for_status()
 
 
+LISTBOT_HEADERS = [
+    "Tarih", "No", "Yemek Türü", "Yemek Adı", "Stok",
+    "Gelen Adet", "Satılan Adet", "Fire", "Devreden", "Eklenme Zamanı",
+]
+
+
+def _values_read_sync(tab: str, rng: str) -> list[list]:
+    sid, _ = _sheet_meta()
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{tab}'!{rng}")}" 
+    r = _session_get().get(url)
+    r.raise_for_status()
+    return r.json().get("values") or []
+
+
+def _product_key(value: str) -> str:
+    # Yalnızca boşluk ve harf büyüklüğü farklarını yok say; belirsiz eşleşme yapma.
+    return " ".join(_norm(value).split())
+
+
+def _product_catalog_sync() -> dict:
+    data = _values_read_sync(SOURCE_TAB_NAME, "B5:C5000")
+    catalog = {}
+    for row in data:
+        if len(row) < 2 or not str(row[1]).strip():
+            continue
+        kind, name = str(row[0]).strip(), str(row[1]).strip()
+        key = _product_key(name)
+        if key in catalog and catalog[key] != (kind, name):
+            raise ValueError(f"Kaynak listede belirsiz ürün eşleşmesi: {name}")
+        catalog[key] = (kind, name)
+    if not catalog:
+        raise ValueError("Günlük Takip!C5:C ürün listesi boş veya okunamadı.")
+    return catalog
+
+
+def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) -> dict:
+    # Sütun adlarını standartlaştır, tanınmayan alanları reddet.
+    aliases = { _norm(k): k for k in LISTBOT_HEADERS }
+    aliases.update({"urun": "Yemek Adı", "urun adi": "Yemek Adı", "yemek": "Yemek Adı", "miktar": "Gelen Adet"})
+    clean = {}
+    for k, v in row.items():
+        key = aliases.get(_norm(k))
+        if not key:
+            raise ValueError(f"Tanınmayan sütun: {k}")
+        clean[key] = v
+    requested = str(clean.get("Yemek Adı") or "").strip()
+    match = catalog.get(_product_key(requested))
+    if not match:
+        raise ValueError(f"Ürün Günlük Takip C sütununda birebir bulunamadı: {requested}")
+    kind, canonical = match
+    clean["Yemek Türü"] = kind
+    clean["Yemek Adı"] = canonical
+    clean["Tarih"] = date
+    clean["Eklenme Zamanı"] = timestamp
+    clean.pop("No", None)  # ListBot'ta sıra numarası otomatik verilir
+    return clean
+
+
+def _format_listbot_header_sync(s, sid: str) -> None:
+    """ListBot'un başlık satırını örnekteki mavi/beyaz görünüme yaklaştırır."""
+    r = s.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}",
+              params={"fields": "sheets.properties(sheetId,title)"})
+    r.raise_for_status()
+    sheet_id = next((sh["properties"]["sheetId"] for sh in r.json().get("sheets", [])
+                     if sh["properties"]["title"] == SHEET_TAB_NAME), None)
+    if sheet_id is None:
+        raise RuntimeError("ListBot sekmesi bulunamadı")
+    requests = [{"repeatCell": {
+        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                  "startColumnIndex": 0, "endColumnIndex": 10},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": {"red": 0.14, "green": 0.38, "blue": 0.89},
+            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                           "bold": True, "fontSize": 12},
+            "verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP"}},
+        "fields": "userEnteredFormat"
+    }}, {"updateDimensionProperties": {
+        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 52}, "fields": "pixelSize"
+    }}]
+    widths = [115, 60, 160, 240, 90, 120, 120, 85, 110, 175]
+    for idx, width in enumerate(widths):
+        requests.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                      "startIndex": idx, "endIndex": idx + 1},
+            "properties": {"pixelSize": width}, "fields": "pixelSize"}})
+    resp = s.post(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
+                  json={"requests": requests})
+    resp.raise_for_status()
+
+
 def append_rows_sync(rows: list[dict]) -> int:
-    """Satırları tabloya ekler; gerekirse başlık satırını ve yeni sütunları oluşturur."""
+    """Yalnızca ListBot'a, sabit sütun sırasıyla ve doğrulanmış ürün adıyla ekler."""
     s = _session_get()
     sid, title = _sheet_meta()
-    base = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values"
-
-    zaman = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
-    rows = [{"Eklenme Zamanı": zaman, **row} for row in rows]
-
-    r = s.get(f"{base}/{quote(f"'{title}'!A1:ZZ1")}")
-    r.raise_for_status()
-    header = (r.json().get("values") or [[]])[0]
-
-    degisti = False
-    for row in rows:
-        for key in row:
-            if key not in header:
-                header.append(key)
-                degisti = True
-    if degisti:
-        r = s.put(
-            f"{base}/{quote(f"'{title}'!A1")}",
-            params={"valueInputOption": "RAW"},
-            json={"values": [header]},
-        )
+    now = datetime.now(TIMEZONE)
+    date, timestamp = now.strftime("%d.%m.%Y"), now.strftime("%d.%m.%Y %H:%M:%S")
+    catalog = _product_catalog_sync()
+    prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
+    current = _values_read_sync(title, "A1:J5000")
+    if current and any(str(x).strip() for x in current[0]):
+        if list(current[0]) != LISTBOT_HEADERS:
+            raise ValueError("ListBot 1. satır başlıkları beklenen A:J düzeninde değil. Mevcut veriler korunuyor; elle kontrol edin.")
+    else:
+        r = s.put(_values_url("A1:J1"), params={"valueInputOption": "RAW"}, json={"values": [LISTBOT_HEADERS]})
         r.raise_for_status()
-
-    values = [[_cell(row.get(h)) for h in header] for row in rows]
-    r = s.post(
-        f"{base}/{quote(f"'{title}'!A1")}:append",
-        params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
-        json={"values": values},
-    )
+        _format_listbot_header_sync(s, sid)
+    existing_numbers = []
+    for row in current[1:]:
+        if len(row) > 1 and str(row[1]).strip().isdigit():
+            existing_numbers.append(int(row[1]))
+    next_no = max(existing_numbers, default=0) + 1
+    values = []
+    for i, row in enumerate(prepared):
+        row["No"] = next_no + i
+        values.append([_cell(row.get(h, "")) for h in LISTBOT_HEADERS])
+    # A:J ile sınırlandır; başlık satırını asla değiştirme.
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:J5000")}:append"
+    r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}, json={"values": values})
     r.raise_for_status()
     return len(values)
 
@@ -624,6 +710,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Yalnızca kullanıcı açıkça isterse islem üret; soru sorulduğunda islem null olsun. "
         "Silme gibi desteklenmeyen işlemlerde islem null olsun ve cevapta bunu yapamadığını söyle. "
         "cevap alanına işlemi yaptığını yazma; ne yapılacağını kısaca özetle, onayı sistem ister. "
+        "Yeni satır eklerken Yemek Adı alanını mutlaka belirt. "
+        "Yemek Türü, No, Tarih ve Eklenme Zamanı otomatik belirlenir. "
+        "Ürün adı Günlük Takip C sütununda doğrulanır; eşleşmeyen kayıt eklenmez. "
         "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
     messages = (
