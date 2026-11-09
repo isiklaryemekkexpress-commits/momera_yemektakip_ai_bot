@@ -93,8 +93,11 @@ EXTRACT_PROMPT = (
     SYSTEM_PROMPT
     + "\n\nFotoğraftaki yemek ve miktar bilgilerini çıkar. "
     "Yalnızca geçerli JSON ver: "
-    '{"ozet":"kısa özet","satirlar":[{"Yemek Adı":"...","Gelen Adet":"...","Satılan Adet":"...","Fire":"...","Stok":"...","Devreden":"..."}]}. '
+    '{"ozet":"kısa özet","satirlar":[{"Yemek Adı":"...","Gelen Adet":"...","Satılan Adet":"...","Fire":"...","Stok":"...","Devreden":"...","Notes":"..."}]}. '
     "Fotoğrafta bulunmayan alanları boş bırak. Her yemek ayrı satırdır. "
+    "Her yemek satırındaki 6 fazla geldi, 3 eksik geldi, geç geldi, iade gibi açıklamaları "
+    "aynen o satırın Notes alanına yaz. Açıklamaları miktar veya yemek adına ekleme. "
+    "Notes sadece açıkça görülen veya kullanıcı tarafından belirtilen açıklama olsun; tahmin etme. "
     "Yemek isimlerini tahmin ederek düzeltme; kod kaynak tablodan doğrulayacak. "
     "Tarih, No ve Eklenme Zamanı alanlarını satırlara ekleme. "
     "Fotoğrafta açıkça yazan tarihi varsa JSON üst düzeyinde tarih alanında DD.MM.YYYY olarak belirt. "
@@ -426,7 +429,7 @@ def write_cell_sync(cell: str, value) -> None:
 
 LISTBOT_HEADERS = [
     "Tarih", "No", "Yemek Türü", "Yemek Adı", "Stok",
-    "Gelen Adet", "Satılan Adet", "Fire", "Devreden", "Eklenme Zamanı",
+    "Gelen Adet", "Satılan Adet", "Fire", "Devreden", "Eklenme Zamanı", "Notes",
 ]
 
 
@@ -535,7 +538,7 @@ def _unmatched_message(missing) -> str:
 def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) -> dict:
     # Sütun adlarını standartlaştır, tanınmayan alanları reddet.
     aliases = { _norm(k): k for k in LISTBOT_HEADERS }
-    aliases.update({"urun": "Yemek Adı", "urun adi": "Yemek Adı", "yemek": "Yemek Adı", "miktar": "Gelen Adet"})
+    aliases.update({"urun": "Yemek Adı", "urun adi": "Yemek Adı", "yemek": "Yemek Adı", "miktar": "Gelen Adet", "not": "Notes", "notlar": "Notes", "aciklama": "Notes", "açıklama": "Notes", "note": "Notes"})
     clean = {}
     for k, v in row.items():
         key = aliases.get(_norm(k))
@@ -572,7 +575,7 @@ def _format_listbot_header_sync(s, sid: str) -> None:
         raise RuntimeError("ListBot sekmesi bulunamadı")
     requests = [{"repeatCell": {
         "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                  "startColumnIndex": 0, "endColumnIndex": 10},
+                  "startColumnIndex": 0, "endColumnIndex": 11},
         "cell": {"userEnteredFormat": {
             "backgroundColor": {"red": 0.14, "green": 0.38, "blue": 0.89},
             "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -583,7 +586,7 @@ def _format_listbot_header_sync(s, sid: str) -> None:
         "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
         "properties": {"pixelSize": 52}, "fields": "pixelSize"
     }}]
-    widths = [115, 60, 160, 240, 90, 120, 120, 85, 110, 175]
+    widths = [115, 60, 160, 240, 90, 120, 120, 85, 110, 175, 260]
     for idx, width in enumerate(widths):
         requests.append({"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
@@ -603,12 +606,12 @@ def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tupl
     timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
     catalog = _product_catalog_sync()
     prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
-    current = _values_read_sync(title, "A1:J5000")
+    current = _values_read_sync(title, "A1:K5000")
     if current and any(str(x).strip() for x in current[0]):
-        if list(current[0]) != LISTBOT_HEADERS:
-            raise ValueError("ListBot 1. satır başlıkları beklenen A:J düzeninde değil. Mevcut veriler korunuyor; elle kontrol edin.")
+        if [str(x).strip() for x in current[0][:11]] != LISTBOT_HEADERS:
+            raise ValueError("ListBot 1. satır başlıkları beklenen A:K düzeninde değil. Mevcut veriler korunuyor; elle kontrol edin.")
     else:
-        r = s.put(_values_url("A1:J1"), params={"valueInputOption": "RAW"}, json={"values": [LISTBOT_HEADERS]})
+        r = s.put(_values_url("A1:K1"), params={"valueInputOption": "RAW"}, json={"values": [LISTBOT_HEADERS]})
         r.raise_for_status()
         _format_listbot_header_sync(s, sid)
     existing_numbers = []
@@ -620,8 +623,8 @@ def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tupl
     for i, row in enumerate(prepared):
         row["No"] = next_no + i
         values.append([_cell(row.get(h, "")) for h in LISTBOT_HEADERS])
-    # A:J ile sınırlandır; başlık satırını asla değiştirme.
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:J5000")}:append"
+    # A:K ile sınırlandır; başlık satırını asla değiştirme.
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:K5000")}:append"
     r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}, json={"values": values})
     r.raise_for_status()
     marked = [str(row["Yemek Adı"]) for row in prepared if str(row["Yemek Adı"]).upper().endswith("-Y")]
@@ -785,7 +788,7 @@ def _onizleme(action: dict) -> str:
         chosen_date = action.get("_tarih") or datetime.now(TIMEZONE).strftime("%d.%m.%Y")
         return (f"ListBot'a {len(action['satirlar'])} satır eklenecek.\n"
                 f"Tarih (A sütunu): {chosen_date}\n"
-                "Porsiyon (F sütunu): Gelen Adet\n\n"
+                "Porsiyon (F sütunu): Gelen Adet\nNotlar (K sütunu): Notes\n\n"
                 + _satir_onizleme(action["satirlar"]))
     return (
         f"{action['hucre']} hücresi değiştirilecek.\n"
@@ -913,6 +916,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Kullanıcı tarih verdiyse işlemde _tarih alanına DD.MM.YYYY olarak ekle; "
         "kullanıcının tarihi fotoğraf veya bugünün tarihinden önceliklidir. "
         "Porsiyon sayıları Gelen Adet sütununa yazılır. "
+        "Yemek yanında fazla geldi, eksik geldi gibi açıklamalar varsa aynı satırın Notes sütununa yaz. "
+        "Not yoksa Notes boş kalsın, notu yemek adına veya miktara ekleme. "
         "Ürün adı Günlük Takip C sütunuyla eşleştirilir; eşleşmeyen ürünler ListBot'a -Y ekiyle kaydedilir. "
         "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
