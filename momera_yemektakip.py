@@ -473,9 +473,15 @@ def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) 
         clean[key] = v
     requested = str(clean.get("Yemek Adı") or "").strip()
     match = _find_product(requested, catalog)
-    if not match:
-        raise ValueError(f"Ürün Günlük Takip C sütununda güvenilir biçimde eşleştirilemedi: {requested}")
-    kind, canonical = match
+    if not requested:
+        raise ValueError("Ürün adı boş; kaydedilemez.")
+    if match:
+        kind, canonical = match
+    else:
+        # Kaynakta eşleşmeyenleri silme/engelleme; elle düzeltme için -Y ile işaretle.
+        kind = str(clean.get("Yemek Türü") or "").strip()
+        canonical = requested if requested.upper().endswith("-Y") else requested + "-Y"
+        logger.warning("Ürün eşleşmedi, -Y ile kaydedilecek: %s", canonical)
     clean["Yemek Türü"] = kind
     clean["Yemek Adı"] = canonical
     clean["Tarih"] = date
@@ -546,7 +552,8 @@ def append_rows_sync(rows: list[dict]) -> int:
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:J5000")}:append"
     r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}, json={"values": values})
     r.raise_for_status()
-    return len(values)
+    marked = [str(row["Yemek Adı"]) for row in prepared if str(row["Yemek Adı"]).upper().endswith("-Y")]
+    return len(values), marked
 
 
 TABLE_CONTEXT_CHARS = int(os.environ.get("TABLE_CONTEXT_CHARS", "6000"))
@@ -598,10 +605,10 @@ async def table_context() -> str:
     return text
 
 
-async def append_rows(rows: list[dict]) -> int:
-    n = await asyncio.to_thread(append_rows_sync, rows)
+async def append_rows(rows: list[dict]) -> tuple[int, list[str]]:
+    result = await asyncio.to_thread(append_rows_sync, rows)
     _table_cache["t"] = 0.0  # yeni satırlar bir sonraki soruda görünsün
-    return n
+    return result
 
 
 async def write_cell(cell: str, value) -> None:
@@ -709,8 +716,10 @@ async def islem_calistir(msg, action: dict) -> bool:
         return True
     try:
         if temiz["tip"] == "satir_ekle":
-            n = await append_rows(temiz["satirlar"])
-            text = f"{n} satır '{SHEET_NAME}' tablosuna eklendi."
+            n, marked = await append_rows(temiz["satirlar"])
+            text = f"{n} satır ListBot tablosuna eklendi."
+            if marked:
+                text += "\nDüzeltmeniz gereken (-Y) ürünler: " + ", ".join(marked)
         else:
             await write_cell(temiz["hucre"], temiz["deger"])
             text = f"{temiz['hucre']} hücresine '{temiz['deger']}' yazıldı."
@@ -738,14 +747,14 @@ async def islem_hazirla(msg, context: ContextTypes.DEFAULT_TYPE, action: dict):
             missing = await asyncio.to_thread(_unmatched_rows_sync, temiz["satirlar"])
         except Exception:
             logger.exception("Ürün listesi okunamadı")
-            await msg.reply_text("Günlük Takip ürün listesi okunamadı; kayıt yapılmadı. Render Logs'u kontrol et.")
+            await msg.reply_text("Günlük Takip ürün listesi okunamadı; yanlış kayıt oluşturmamak için işlem durduruldu.")
             return
         if missing:
-            context.user_data["duzeltilecek"] = temiz
-            context.user_data.pop("bekleyen", None)
-            for part in split_text(_unmatched_message(missing)):
-                await msg.reply_text(part)
-            return
+            context.user_data["isaretlenecek"] = [name for _, name, _ in missing]
+            names = ", ".join((name if name.upper().endswith("-Y") else name + "-Y") for _, name, _ in missing)
+            await msg.reply_text("Eşleşmeyen ürünler ListBot'a -Y ekiyle eklenecek: " + names[:3500])
+        else:
+            context.user_data.pop("isaretlenecek", None)
         context.user_data.pop("duzeltilecek", None)
     if not PERMS["onay"]:
         await islem_calistir(msg, temiz)
@@ -768,49 +777,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await izinli_mi(update):
         return
     user_text = update.message.text
-    if user_text.strip().casefold().startswith("düzelt:") or user_text.strip().casefold().startswith("duzelt:"):
-        pending = context.user_data.get("duzeltilecek")
-        if not pending:
-            await update.message.reply_text("Düzeltilecek bekleyen kayıt yok. Önce fotoğrafı veya listeyi gönder.")
-            return
-        changes = user_text.split(":", 1)[1].strip().splitlines()
-        pairs = []
-        for line in changes:
-            if "=" not in line:
-                await update.message.reply_text("Her düzeltmeyi 'Yanlış Ürün = Doğru Ürün' biçiminde yaz.")
-                return
-            old, new = (part.strip() for part in line.split("=", 1))
-            if not old or not new:
-                await update.message.reply_text("Ürün adları boş olamaz.")
-                return
-            pairs.append((old, new))
-        if not pairs:
-            await update.message.reply_text("Düzeltme bulunamadı.")
-            return
-        # Kaynak listedeki adları yalnızca gerçek katalog girdileri arasından kabul et.
-        try:
-            catalog = await asyncio.to_thread(_product_catalog_sync)
-        except Exception:
-            logger.exception("Ürün listesi okunamadı")
-            await update.message.reply_text("Kaynak ürün listesi okunamadı; tekrar dene.")
-            return
-        for old, new in pairs:
-            if _product_key(new) not in catalog:
-                await update.message.reply_text(f"'{new}' Günlük Takip C sütununda bulunmuyor. Tam kaynak adını yaz.")
-                return
-        updated = {**pending, "satirlar": [dict(r) for r in pending["satirlar"]]}
-        for old, new in pairs:
-            found = False
-            for row in updated["satirlar"]:
-                if _product_key(_requested_name(row)) == _product_key(old):
-                    row["Yemek Adı"] = catalog[_product_key(new)][1]
-                    found = True
-            if not found:
-                await update.message.reply_text(f"Bekleyen kayıtlarda '{old}' bulunamadı. Düzeltme uygulanmadı.")
-                return
-        context.user_data["duzeltilecek"] = updated
-        await islem_hazirla(update.message, context, updated)
-        return
     history = context.user_data.setdefault("gecmis", [])
 
     await context.bot.send_chat_action(
@@ -846,7 +812,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cevap alanına işlemi yaptığını yazma; ne yapılacağını kısaca özetle, onayı sistem ister. "
         "Yeni satır eklerken Yemek Adı alanını mutlaka belirt. "
         "Yemek Türü, No, Tarih ve Eklenme Zamanı otomatik belirlenir. "
-        "Ürün adı Günlük Takip C sütununda doğrulanır; eşleşmeyen kayıt eklenmez. "
+        "Ürün adı Günlük Takip C sütunuyla eşleştirilir; eşleşmeyen ürünler ListBot'a -Y ekiyle kaydedilir. "
         "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
     messages = (
