@@ -102,7 +102,9 @@ EXTRACT_PROMPT = (
     "Tarih, No ve Eklenme Zamanı alanlarını satırlara ekleme. "
     "Fotoğrafta açıkça yazan tarihi varsa JSON üst düzeyinde tarih alanında DD.MM.YYYY olarak belirt. "
     "Fotoğrafta görünür bütün yemekleri sırasıyla çıkar; porsiyon sayılarını Gelen Adet alanına yaz. "
-    "Kullanıcı açıklamasındaki tarih fotoğraftaki tarihten önceliklidir."
+    "Kullanıcı açıklamasındaki tarih fotoğraftaki tarihten önceliklidir. "
+    "Eklenme Zamanı S sütununa, Notes T sütununa kaydedilir. "
+    "J:R hesaplama sütunlarına veri üretme."
 )
 
 
@@ -427,10 +429,17 @@ def write_cell_sync(cell: str, value) -> None:
     r.raise_for_status()
 
 
+# ListBot gerçek sütun düzeni (A:T). J:R hesaplama/formül alanlarıdır.
 LISTBOT_HEADERS = [
     "Tarih", "No", "Yemek Türü", "Yemek Adı", "Stok",
-    "Gelen Adet", "Satılan Adet", "Fire", "Devreden", "Eklenme Zamanı", "Notes",
+    "Gelen Adet", "Satılan Adet", "Fire", "Devreden",
+    "Birim Maliyet", "Fire Maliyeti", "Satış Fiyatı", "Ciro",
+    "Satış Maliyeti", "Brüt Kâr", "Üretim", "T_Maliyeti",
+    "Firesiz_Satış", "Eklenme Zamanı", "Notes",
 ]
+INPUT_HEADERS = LISTBOT_HEADERS[:9]
+CALCULATED_HEADERS = LISTBOT_HEADERS[9:18]
+OUTPUT_HEADERS = LISTBOT_HEADERS[18:]
 
 
 def _values_read_sync(tab: str, rng: str) -> list[list]:
@@ -544,6 +553,9 @@ def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) 
         key = aliases.get(_norm(k))
         if not key:
             raise ValueError(f"Tanınmayan sütun: {k}")
+        if key in CALCULATED_HEADERS:
+            # Hesaplama alanları yalnızca Google Sheets formüllerine aittir.
+            continue
         clean[key] = v
     requested = str(clean.get("Yemek Adı") or "").strip()
     match = _find_product(requested, catalog)
@@ -564,41 +576,28 @@ def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) 
     return clean
 
 
-def _format_listbot_header_sync(s, sid: str) -> None:
-    """ListBot'un başlık satırını örnekteki mavi/beyaz görünüme yaklaştırır."""
-    r = s.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}",
-              params={"fields": "sheets.properties(sheetId,title)"})
-    r.raise_for_status()
-    sheet_id = next((sh["properties"]["sheetId"] for sh in r.json().get("sheets", [])
-                     if sh["properties"]["title"] == SHEET_TAB_NAME), None)
-    if sheet_id is None:
-        raise RuntimeError("ListBot sekmesi bulunamadı")
-    requests = [{"repeatCell": {
-        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                  "startColumnIndex": 0, "endColumnIndex": 11},
-        "cell": {"userEnteredFormat": {
-            "backgroundColor": {"red": 0.14, "green": 0.38, "blue": 0.89},
-            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                           "bold": True, "fontSize": 12},
-            "verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP"}},
-        "fields": "userEnteredFormat"
-    }}, {"updateDimensionProperties": {
-        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
-        "properties": {"pixelSize": 52}, "fields": "pixelSize"
-    }}]
-    widths = [115, 60, 160, 240, 90, 120, 120, 85, 110, 175, 260]
-    for idx, width in enumerate(widths):
-        requests.append({"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": idx, "endIndex": idx + 1},
-            "properties": {"pixelSize": width}, "fields": "pixelSize"}})
-    resp = s.post(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
-                  json={"requests": requests})
-    resp.raise_for_status()
+def _check_listbot_headers(current: list[list]) -> None:
+    """Var olan A:I ve S:T başlıklarını denetler; J:R formüllerine dokunmaz."""
+    if not current or not current[0] or not any(str(x).strip() for x in current[0]):
+        raise ValueError(
+            "ListBot başlıkları bulunamadı. A:T başlıklarını Google Sheets'te oluşturun; "
+            "bot mevcut düzeni kendisi değiştirmeyecek."
+        )
+    header = [str(v).strip() for v in current[0]]
+    header += [""] * max(0, 20 - len(header))
+    for idx in list(range(9)) + [18, 19]:
+        if header[idx] != LISTBOT_HEADERS[idx]:
+            col = index_to_col(idx + 1)
+            raise ValueError(
+                f"ListBot {col}1 başlığı '{LISTBOT_HEADERS[idx]}' olmalı; "
+                f"şu an '{header[idx]}' görünüyor. Kayıt yapılmadı."
+            )
 
 
 def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
-    """Yalnızca ListBot'a, sabit sütun sırasıyla ve doğrulanmış ürün adıyla ekler."""
+    """A:I alanına ekler, S:T'yi aynı satırlara yazar; J:R'ye ASLA yazmaz."""
+    if not rows:
+        raise ValueError("Eklenecek satır yok.")
     s = _session_get()
     sid, title = _sheet_meta()
     now = datetime.now(TIMEZONE)
@@ -606,29 +605,50 @@ def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tupl
     timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
     catalog = _product_catalog_sync()
     prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
-    current = _values_read_sync(title, "A1:K5000")
-    if current and any(str(x).strip() for x in current[0]):
-        if [str(x).strip() for x in current[0][:11]] != LISTBOT_HEADERS:
-            raise ValueError("ListBot 1. satır başlıkları beklenen A:K düzeninde değil. Mevcut veriler korunuyor; elle kontrol edin.")
-    else:
-        r = s.put(_values_url("A1:K1"), params={"valueInputOption": "RAW"}, json={"values": [LISTBOT_HEADERS]})
-        r.raise_for_status()
-        _format_listbot_header_sync(s, sid)
-    existing_numbers = []
-    for row in current[1:]:
-        if len(row) > 1 and str(row[1]).strip().isdigit():
-            existing_numbers.append(int(row[1]))
+    current = _values_read_sync(title, "A1:T5000")
+    _check_listbot_headers(current)
+
+    existing_numbers = [
+        int(row[1]) for row in current[1:]
+        if len(row) > 1 and str(row[1]).strip().isdigit()
+    ]
     next_no = max(existing_numbers, default=0) + 1
-    values = []
     for i, row in enumerate(prepared):
         row["No"] = next_no + i
-        values.append([_cell(row.get(h, "")) for h in LISTBOT_HEADERS])
-    # A:K ile sınırlandır; başlık satırını asla değiştirme.
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:K5000")}:append"
-    r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}, json={"values": values})
+
+    # Önce yalnızca A:I yaz. OVERWRITE mevcut J:R formüllerini ve
+    # S:T hücrelerini korur (INSERT_ROWS tüm satırı kaydırabilir).
+    values = [[_cell(row.get(h, "")) for h in INPUT_HEADERS] for row in prepared]
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{title}'!A1:I5000")}:append"
+    r = s.post(url, params={"valueInputOption": "RAW", "insertDataOption": "OVERWRITE"},
+               json={"values": values})
     r.raise_for_status()
-    marked = [str(row["Yemek Adı"]) for row in prepared if str(row["Yemek Adı"]).upper().endswith("-Y")]
-    return len(values), marked
+    updated = r.json().get("updates", {}).get("updatedRange", "")
+    match = re.search(r"!A(\d+):I(\d+)$", updated)
+    if not match:
+        # Veri A:I'ye yazılmış olabilir. Tekrar eklemek mükerrer kayıt oluşturur.
+        raise RuntimeError(
+            "Yemekler A:I'ye eklenmiş olabilir ancak satır numarası alınamadı. "
+            "Tekrar denemeden önce ListBot'u kontrol edin."
+        )
+    first, last = map(int, match.groups())
+    if last - first + 1 != len(prepared):
+        raise RuntimeError("Eklenen satır sayısı beklenenden farklı. Tekrar denemeden önce tabloyu kontrol edin.")
+
+    # S = Eklenme Zamanı, T = Notes. J:R'ye dokunulmaz.
+    notes_values = [[_cell(row.get(h, "")) for h in OUTPUT_HEADERS] for row in prepared]
+    notes_range = f"S{first}:T{last}"
+    r = s.put(_values_url(notes_range), params={"valueInputOption": "RAW"},
+              json={"values": notes_values})
+    if r.status_code >= 400:
+        logger.error("A:I yazıldı, S:T yazılamadı. Satırlar %s-%s: %s", first, last, r.text[:500])
+        raise RuntimeError(
+            f"A:I satır {first}-{last} eklendi fakat S:T yazılamadı. "
+            "Tekrar onaylamayın; tablodaki kayıtları kontrol edin."
+        )
+    marked = [str(row["Yemek Adı"]) for row in prepared
+              if str(row["Yemek Adı"]).upper().endswith("-Y")]
+    return len(prepared), marked
 
 
 TABLE_CONTEXT_CHARS = int(os.environ.get("TABLE_CONTEXT_CHARS", "6000"))
@@ -748,6 +768,8 @@ async def dogrula(action: dict) -> tuple[dict | None, str]:
             return None, "Bu hücreye yazılamaz."
         if row in PERMS["korumali_satirlar"]:
             return None, f"{row}. satır korumalı, değiştirilemez (kurallar.md)."
+        if 10 <= col_to_index(col) <= 18:
+            return None, "J:R maliyet/hesaplama sütunları bot tarafından değiştirilemez."
         deger = action.get("deger")
         if isinstance(deger, (dict, list)) or deger is None or len(str(deger)) > 500:
             return None, "Yazılacak değer geçersiz."
@@ -788,7 +810,7 @@ def _onizleme(action: dict) -> str:
         chosen_date = action.get("_tarih") or datetime.now(TIMEZONE).strftime("%d.%m.%Y")
         return (f"ListBot'a {len(action['satirlar'])} satır eklenecek.\n"
                 f"Tarih (A sütunu): {chosen_date}\n"
-                "Porsiyon (F sütunu): Gelen Adet\nNotlar (K sütunu): Notes\n\n"
+                "Porsiyon (F sütunu): Gelen Adet\nNotlar (T sütunu): Notes\n\n"
                 + _satir_onizleme(action["satirlar"]))
     return (
         f"{action['hucre']} hücresi değiştirilecek.\n"
@@ -813,14 +835,15 @@ async def islem_calistir(msg, action: dict) -> bool:
             await write_cell(temiz["hucre"], temiz["deger"])
             text = f"{temiz['hucre']} hücresine '{temiz['deger']}' yazıldı."
     except ValueError as exc:
-        await msg.reply_text(f"Kayıt yapılamadı: {exc}\nHiçbir satır eklenmedi. Lütfen ürün adlarını düzelt.")
+        await msg.reply_text(f"Kayıt yapılamadı: {exc}")
         return True
-    except Exception:
+    except Exception as exc:
         logger.exception("Tabloya yazılırken hata oluştu")
         await msg.reply_text(
-            "Tabloya yazarken hata oluştu. Biraz sonra tekrar onay düğmesine basabilirsiniz."
+            f"Tabloya yazarken hata oluştu: {exc}\n"
+            "Mükerrer kayıt oluşmaması için yeniden onaylamadan önce ListBot'u kontrol edin."
         )
-        return False
+        return True
     await msg.reply_text(text)
     return True
 
@@ -918,6 +941,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Porsiyon sayıları Gelen Adet sütununa yazılır. "
         "Yemek yanında fazla geldi, eksik geldi gibi açıklamalar varsa aynı satırın Notes sütununa yaz. "
         "Not yoksa Notes boş kalsın, notu yemek adına veya miktara ekleme. "
+        "ListBot sütunları: A Tarih, B No, C Yemek Türü, D Yemek Adı, E Stok, "
+        "F Gelen Adet, G Satılan Adet, H Fire, I Devreden, J:R hesaplama alanları, "
+        "S Eklenme Zamanı, T Notes. J:R alanlarına yazma. "
         "Ürün adı Günlük Takip C sütunuyla eşleştirilir; eşleşmeyen ürünler ListBot'a -Y ekiyle kaydedilir. "
         "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
