@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, date as calendar_date
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -96,8 +96,79 @@ EXTRACT_PROMPT = (
     '{"ozet":"kısa özet","satirlar":[{"Yemek Adı":"...","Gelen Adet":"...","Satılan Adet":"...","Fire":"...","Stok":"...","Devreden":"..."}]}. '
     "Fotoğrafta bulunmayan alanları boş bırak. Her yemek ayrı satırdır. "
     "Yemek isimlerini tahmin ederek düzeltme; kod kaynak tablodan doğrulayacak. "
-    "Tarih, No ve Eklenme Zamanı alanlarını üretme."
+    "Tarih, No ve Eklenme Zamanı alanlarını satırlara ekleme. "
+    "Fotoğrafta açıkça yazan tarihi varsa JSON üst düzeyinde tarih alanında DD.MM.YYYY olarak belirt. "
+    "Fotoğrafta görünür bütün yemekleri sırasıyla çıkar; porsiyon sayılarını Gelen Adet alanına yaz. "
+    "Kullanıcı açıklamasındaki tarih fotoğraftaki tarihten önceliklidir."
 )
+
+
+# --------------------------------------------------------- Tarih / kullanıcı talimatı
+DATE_FULL_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
+DATE_DAY_RE = re.compile(r"(?:tarih(?:i|e)?|gün(?:ü|e)?)\s*(?:olarak\s*)?(\d{1,2})(?![\d./-])", re.I)
+FIRST_ROWS_RE = re.compile(r"(?:ilk|baştaki|bastaki)\s+(\d{1,3})\s*(?:satır|satiri|satırı|yemek|ürün|urun|kayıt|kayit)?", re.I)
+
+
+def _valid_date(day: int, month: int, year: int) -> str:
+    try:
+        return calendar_date(year, month, day).strftime("%d.%m.%Y")
+    except ValueError as exc:
+        raise ValueError(f"Geçersiz tarih: {day:02d}.{month:02d}.{year}") from exc
+
+
+def _date_from_text(text: str, reference: str = "") -> str | None:
+    """Tam tarih veya 'tarih 02' gibi gün düzeltmesi; tarih yoksa None."""
+    text = str(text or "")
+    match = DATE_FULL_RE.search(text)
+    if match:
+        return _valid_date(*map(int, match.groups()))
+    match = DATE_DAY_RE.search(text)
+    if match:
+        base = DATE_FULL_RE.search(str(reference or ""))
+        if base:
+            _, month, year = map(int, base.groups())
+        else:
+            today = datetime.now(TIMEZONE)
+            month, year = today.month, today.year
+        return _valid_date(int(match.group(1)), month, year)
+    return None
+
+
+def _first_rows_from_text(text: str) -> int | None:
+    match = FIRST_ROWS_RE.search(str(text or ""))
+    return int(match.group(1)) if match else None
+
+
+def _is_instruction_update(text: str) -> bool:
+    """Bekleyen fotoğraf kaydına uygulanacak kısa tarih/adet/satır talimatı."""
+    t = _norm(text)
+    return bool(_date_from_text(text) or _first_rows_from_text(text)) and (
+        len(text) < 180 and ("tarih" in t or "ilk " in t or "gun" in t)
+    )
+
+
+def _apply_user_constraints(action: dict, instruction: str, photo_date: str = "") -> dict:
+    """Kullanıcının yazdığı tarih ve satır sınırını AI çıktısından bağımsız uygula."""
+    action = dict(action)
+    if action.get("tip") != "satir_ekle":
+        return action
+    rows = [dict(row) for row in action.get("satirlar", []) if isinstance(row, dict)]
+    date = _date_from_text(instruction, photo_date or str(action.get("_tarih", "")))
+    if date:
+        action["_tarih"] = date
+        action["_tarih_kaynagi"] = "kullanıcı"
+    elif photo_date and not action.get("_tarih"):
+        action["_tarih"] = _date_from_text(photo_date)
+        action["_tarih_kaynagi"] = "fotoğraf"
+    count = _first_rows_from_text(instruction)
+    if count is not None:
+        if count < 1:
+            raise ValueError("Satır sayısı 1 veya daha büyük olmalı.")
+        action["_limit"] = count
+    if action.get("_limit") is not None:
+        rows = rows[:int(action["_limit"])]
+    action["satirlar"] = rows
+    return action
 
 
 # ------------------------------------------------------------ Yazma izinleri
@@ -216,7 +287,7 @@ async def groq_chat(messages: list[dict], model: str, json_mode: bool = False) -
         "messages": messages,
         "temperature": 0.2,
         # Ücretsiz katmanda dakikada 1000 çıktı tokenı sınırı var; isteği buna göre kısıtla.
-        "max_completion_tokens": 900 if json_mode else 500,
+        "max_completion_tokens": 2400 if json_mode else 700,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -523,12 +594,13 @@ def _format_listbot_header_sync(s, sid: str) -> None:
     resp.raise_for_status()
 
 
-def append_rows_sync(rows: list[dict]) -> int:
+def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
     """Yalnızca ListBot'a, sabit sütun sırasıyla ve doğrulanmış ürün adıyla ekler."""
     s = _session_get()
     sid, title = _sheet_meta()
     now = datetime.now(TIMEZONE)
-    date, timestamp = now.strftime("%d.%m.%Y"), now.strftime("%d.%m.%Y %H:%M:%S")
+    date = _date_from_text(date_override) if date_override else now.strftime("%d.%m.%Y")
+    timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
     catalog = _product_catalog_sync()
     prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
     current = _values_read_sync(title, "A1:J5000")
@@ -605,8 +677,8 @@ async def table_context() -> str:
     return text
 
 
-async def append_rows(rows: list[dict]) -> tuple[int, list[str]]:
-    result = await asyncio.to_thread(append_rows_sync, rows)
+async def append_rows(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
+    result = await asyncio.to_thread(append_rows_sync, rows, date_override)
     _table_cache["t"] = 0.0  # yeni satırlar bir sonraki soruda görünsün
     return result
 
@@ -652,7 +724,17 @@ async def dogrula(action: dict) -> tuple[dict | None, str]:
                     izinsiz.add(str(k))
         if izinsiz:
             return None, "Şu sütunlara yazma izni yok: " + ", ".join(sorted(izinsiz))
-        return {"tip": "satir_ekle", "satirlar": rows}, ""
+        selected_date = action.get("_tarih")
+        if selected_date:
+            try:
+                selected_date = _date_from_text(str(selected_date))
+            except ValueError as exc:
+                return None, str(exc)
+            if not selected_date:
+                return None, "Tarih DD.MM.YYYY biçiminde olmalı."
+        return {"tip": "satir_ekle", "satirlar": rows,
+                "_tarih": selected_date, "_tarih_kaynagi": action.get("_tarih_kaynagi", "otomatik"),
+                "_limit": action.get("_limit")}, ""
 
     if tip == "hucre_yaz":
         m = CELL_RE.match(str(action.get("hucre", "")).strip())
@@ -700,7 +782,11 @@ def _satir_onizleme(rows: list[dict]) -> str:
 
 def _onizleme(action: dict) -> str:
     if action["tip"] == "satir_ekle":
-        return "Tabloya eklenecek satırlar:\n" + _satir_onizleme(action["satirlar"])
+        chosen_date = action.get("_tarih") or datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+        return (f"ListBot'a {len(action['satirlar'])} satır eklenecek.\n"
+                f"Tarih (A sütunu): {chosen_date}\n"
+                "Porsiyon (F sütunu): Gelen Adet\n\n"
+                + _satir_onizleme(action["satirlar"]))
     return (
         f"{action['hucre']} hücresi değiştirilecek.\n"
         f"Eski değer: {action.get('eski') or '(boş)'}\n"
@@ -716,7 +802,7 @@ async def islem_calistir(msg, action: dict) -> bool:
         return True
     try:
         if temiz["tip"] == "satir_ekle":
-            n, marked = await append_rows(temiz["satirlar"])
+            n, marked = await append_rows(temiz["satirlar"], temiz.get("_tarih"))
             text = f"{n} satır ListBot tablosuna eklendi."
             if marked:
                 text += "\nDüzeltmeniz gereken (-Y) ürünler: " + ", ".join(marked)
@@ -777,6 +863,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await izinli_mi(update):
         return
     user_text = update.message.text
+    # Fotoğraftan sonra "tarih 02 olsun" / "ilk 10 satır" denirse mevcut onayı güncelle.
+    pending = context.user_data.get("bekleyen")
+    if pending and pending.get("tip") == "satir_ekle" and _is_instruction_update(user_text):
+        try:
+            revised = _apply_user_constraints(pending, user_text,
+                                              pending.get("_tarih") or "")
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        context.user_data.pop("bekleyen", None)
+        await islem_hazirla(update.message, context, revised)
+        return
     history = context.user_data.setdefault("gecmis", [])
 
     await context.bot.send_chat_action(
@@ -811,7 +909,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Silme gibi desteklenmeyen işlemlerde islem null olsun ve cevapta bunu yapamadığını söyle. "
         "cevap alanına işlemi yaptığını yazma; ne yapılacağını kısaca özetle, onayı sistem ister. "
         "Yeni satır eklerken Yemek Adı alanını mutlaka belirt. "
-        "Yemek Türü, No, Tarih ve Eklenme Zamanı otomatik belirlenir. "
+        "Yemek Türü, No ve Eklenme Zamanı otomatik belirlenir. "
+        "Kullanıcı tarih verdiyse işlemde _tarih alanına DD.MM.YYYY olarak ekle; "
+        "kullanıcının tarihi fotoğraf veya bugünün tarihinden önceliklidir. "
+        "Porsiyon sayıları Gelen Adet sütununa yazılır. "
         "Ürün adı Günlük Takip C sütunuyla eşleştirilir; eşleşmeyen ürünler ListBot'a -Y ekiyle kaydedilir. "
         "Geçerli yazma izinleri: " + izin_ozeti() + "."
     )
@@ -844,6 +945,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in split_text(cevap) if cevap else []:
         await update.message.reply_text(part)
     if isinstance(islem, dict) and islem:
+        try:
+            islem = _apply_user_constraints(islem, user_text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
         await islem_hazirla(update.message, context, islem)
 
 
@@ -903,7 +1009,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.get("ozet"):
         await msg.reply_text(str(result["ozet"])[:TELEGRAM_MAX_LEN])
-    await islem_hazirla(msg, context, {"tip": "satir_ekle", "satirlar": rows})
+    requested_count = _first_rows_from_text(caption)
+    if requested_count is not None and len(rows) < requested_count:
+        await msg.reply_text(
+            f"Dikkat: İlk {requested_count} satırı istedin ama fotoğraftan yalnızca "
+            f"{len(rows)} yemek okunabildi. Eksik satırları uydurmuyorum."
+        )
+    try:
+        action = {"tip": "satir_ekle", "satirlar": rows}
+        photo_date = str(result.get("tarih") or "")
+        action = _apply_user_constraints(action, caption, photo_date)
+    except ValueError as exc:
+        await msg.reply_text(str(exc))
+        return
+    await islem_hazirla(msg, context, action)
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
