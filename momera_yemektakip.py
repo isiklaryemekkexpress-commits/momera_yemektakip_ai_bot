@@ -379,9 +379,10 @@ def _product_catalog_sync() -> dict:
             continue
         kind, name = str(row[0]).strip(), str(row[1]).strip()
         key = _product_key(name)
-        if key in catalog and catalog[key] != (kind, name):
-            raise ValueError(f"Kaynak listede belirsiz ürün eşleşmesi: {name}")
-        catalog[key] = (kind, name)
+        # Aynı isim tekrar ediyorsa ilk görülen ürün kaydını koru.
+        # Böylece farklı türle tekrarlansa bile kayıt işlemi durmaz.
+        if key not in catalog:
+            catalog[key] = (kind, name)
     if not catalog:
         raise ValueError("Günlük Takip!C5:C ürün listesi boş veya okunamadı.")
     return catalog
