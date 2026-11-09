@@ -41,7 +41,8 @@ GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SHEET_NAME = os.environ.get("SHEET_NAME", "yemekkexpress_yemektakip_AI")
-SHEET_ID = os.environ.get("SHEET_ID")  # opsiyonel; verilirse ad aranmaz
+SHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
+SHEET_TAB_NAME = "ListBot"  # Verilerin okunacağı ve yazılacağı tek sekme
 # Boş bırakılırsa herkes kullanabilir. Doluysa virgülle ayrılmış Telegram kullanıcı ID'leri.
 ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
@@ -259,35 +260,26 @@ def _session_get() -> AuthorizedSession:
 
 
 def _sheet_meta() -> tuple[str, str]:
-    """(dosya_id, ilk_sayfa_adı) döndürür."""
+    """Google Sheets dosyasında yalnızca ListBot sekmesini seçer."""
     if _sheet_cache:
         return _sheet_cache["id"], _sheet_cache["title"]
+
     s = _session_get()
     sid = SHEET_ID
-    if not sid:
-        q = (
-            f"name = '{SHEET_NAME}' and trashed = false and "
-            "mimeType = 'application/vnd.google-apps.spreadsheet'"
-        )
-        r = s.get(
-            "https://www.googleapis.com/drive/v3/files",
-            params={"q": q, "fields": "files(id,name)"},
-        )
-        r.raise_for_status()
-        files = r.json().get("files", [])
-        if not files:
-            raise RuntimeError(
-                f"'{SHEET_NAME}' tablosu bulunamadı. Tablo service account ile paylaşıldı mı?"
-            )
-        sid = files[0]["id"]
     r = s.get(
         f"https://sheets.googleapis.com/v4/spreadsheets/{sid}",
-        params={"fields": "sheets.properties.title"},
+        params={"fields": "sheets.properties(title)"},
     )
     r.raise_for_status()
-    title = r.json()["sheets"][0]["properties"]["title"]
-    _sheet_cache.update({"id": sid, "title": title})
-    return sid, title
+    for sheet in r.json().get("sheets", []):
+        title = sheet["properties"]["title"]
+        if title == SHEET_TAB_NAME:
+            _sheet_cache.update({"id": sid, "title": title})
+            return sid, title
+    raise RuntimeError(
+        f"'{SHEET_TAB_NAME}' sekmesi bulunamadı. "
+        "Sekme adının Google Sheets'te birebir aynı olduğundan emin olun."
+    )
 
 
 def _cell(value):
