@@ -390,39 +390,75 @@ def _product_catalog_sync() -> dict:
 
 
 def _find_product(requested: str, catalog: dict):
-    """Önce tam ad, sonra kontrollü kelime/benzerlik eşleşmesi; ilk kayıt kazanır."""
+    """Önce kesin, sonra kelime/kısmi ve yazım hatası eşleşmesi.
+
+    Belirsiz veya düşük güvenli ürünleri tahmin ederek kaydetmez.
+    """
     key = _product_key(requested)
-    if key in catalog:
-        return catalog[key]
     if not key:
         return None
+    if key in catalog:
+        return catalog[key]
 
-    # Acılı Dana Güveç -> Acılı Güveç gibi fazladan niteleyicileri tolere et.
-    words = set(key.split())
-    candidates = []
+    words = key.split()
+    ranked = []
     for position, (candidate_key, value) in enumerate(catalog.items()):
-        other = set(candidate_key.split())
-        common = words & other
-        if not common:
-            continue
-        coverage = len(common) / len(other)
+        candidate_words = candidate_key.split()
+        shared = set(words) & set(candidate_words)
         similarity = SequenceMatcher(None, key, candidate_key).ratio()
-        # Tek ortak genel kelime ile tamamen farklı yemekleri eşleştirme.
-        if (len(common) >= 2 and coverage >= 0.75) or similarity >= 0.86:
-            score = 0.65 * coverage + 0.35 * similarity
-            candidates.append((score, -position, value, candidate_key))
-    if not candidates:
+        # "Yağlama" -> "Kayseri Yağlama"; tek kelime tam token olmalı.
+        partial = (len(words) == 1 and words[0] in candidate_words and
+                   len(words[0]) >= 5)
+        # "Acılı Dana Güveç" -> "Acılı Güveç".
+        coverage = len(shared) / max(1, len(set(candidate_words)))
+        meaningful = (len(shared) >= 2 and coverage >= 0.70)
+        # "Otman Kebabı" -> "Orman Kebabı".
+        typo = similarity >= 0.80 and (bool(shared) or similarity >= 0.88)
+        if not (partial or meaningful or typo):
+            continue
+        score = (1.0 if partial else 0.0) + (0.85 if meaningful else 0.0) + similarity * 0.35
+        ranked.append((score, -position, value))
+    if not ranked:
         return None
-    candidates.sort(reverse=True)
-    best = candidates[0]
-    # Yakın puanlı iki farklı ad varsa yanlış ürünü sessizce seçme.
-    if len(candidates) > 1 and best[0] - candidates[1][0] < 0.045:
-        raise ValueError(
-            f"Ürün eşleşmesi belirsiz: {requested}. "
-            f"Olası ürünler: {best[2][1]}, {candidates[1][2][1]}"
-        )
-    logger.info("Ürün eşleştirildi: %s -> %s", requested, best[2][1])
-    return best[2]
+    ranked.sort(reverse=True)
+    # İki farklı yemek aynı derecede uygun görünüyorsa kullanıcı düzeltsin.
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.035:
+        return None
+    logger.info("Ürün eşleştirildi: %s -> %s", requested, ranked[0][2][1])
+    return ranked[0][2]
+
+
+def _requested_name(row: dict) -> str:
+    for k, v in row.items():
+        if _norm(k) in ("yemek adi", "urun", "urun adi", "yemek"):
+            return str(v or "").strip()
+    return ""
+
+
+def _unmatched_rows_sync(rows: list[dict]) -> list[tuple[int, str, list[str]]]:
+    """Onaydan önce TÜM satırları kontrol eder; hiçbir şey yazmaz."""
+    catalog = _product_catalog_sync()
+    missing = []
+    for i, row in enumerate(rows, 1):
+        name = _requested_name(row)
+        if not _find_product(name, catalog):
+            from difflib import get_close_matches
+            keys = get_close_matches(_product_key(name), list(catalog), n=3, cutoff=0.38)
+            suggestions = [catalog[k][1] for k in keys]
+            missing.append((i, name or "(ürün adı boş)", suggestions))
+    return missing
+
+
+def _unmatched_message(missing) -> str:
+    lines = ["Şu ürünleri Günlük Takip C sütunuyla güvenle eşleştiremedim:"]
+    for i, name, suggestions in missing:
+        lines.append(f"{i}. satır: {name}")
+        if suggestions:
+            lines.append("   Olası isimler: " + ", ".join(suggestions))
+    lines.append("\nHiçbir satır eklenmedi. Düzeltmek için şu biçimde mesaj gönder:")
+    lines.append("düzelt: Yanlış Ürün = Kaynaktaki Doğru Ürün")
+    lines.append("Birden çok düzeltmeyi ayrı satırlara yazabilirsin. Sonra yeniden onay isteyeceğim.")
+    return "\n".join(lines)
 
 
 def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) -> dict:
@@ -678,6 +714,9 @@ async def islem_calistir(msg, action: dict) -> bool:
         else:
             await write_cell(temiz["hucre"], temiz["deger"])
             text = f"{temiz['hucre']} hücresine '{temiz['deger']}' yazıldı."
+    except ValueError as exc:
+        await msg.reply_text(f"Kayıt yapılamadı: {exc}\nHiçbir satır eklenmedi. Lütfen ürün adlarını düzelt.")
+        return True
     except Exception:
         logger.exception("Tabloya yazılırken hata oluştu")
         await msg.reply_text(
@@ -694,6 +733,20 @@ async def islem_hazirla(msg, context: ContextTypes.DEFAULT_TYPE, action: dict):
     if temiz is None:
         await msg.reply_text(hata)
         return
+    if temiz["tip"] == "satir_ekle":
+        try:
+            missing = await asyncio.to_thread(_unmatched_rows_sync, temiz["satirlar"])
+        except Exception:
+            logger.exception("Ürün listesi okunamadı")
+            await msg.reply_text("Günlük Takip ürün listesi okunamadı; kayıt yapılmadı. Render Logs'u kontrol et.")
+            return
+        if missing:
+            context.user_data["duzeltilecek"] = temiz
+            context.user_data.pop("bekleyen", None)
+            for part in split_text(_unmatched_message(missing)):
+                await msg.reply_text(part)
+            return
+        context.user_data.pop("duzeltilecek", None)
     if not PERMS["onay"]:
         await islem_calistir(msg, temiz)
         return
@@ -715,6 +768,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await izinli_mi(update):
         return
     user_text = update.message.text
+    if user_text.strip().casefold().startswith("düzelt:") or user_text.strip().casefold().startswith("duzelt:"):
+        pending = context.user_data.get("duzeltilecek")
+        if not pending:
+            await update.message.reply_text("Düzeltilecek bekleyen kayıt yok. Önce fotoğrafı veya listeyi gönder.")
+            return
+        changes = user_text.split(":", 1)[1].strip().splitlines()
+        pairs = []
+        for line in changes:
+            if "=" not in line:
+                await update.message.reply_text("Her düzeltmeyi 'Yanlış Ürün = Doğru Ürün' biçiminde yaz.")
+                return
+            old, new = (part.strip() for part in line.split("=", 1))
+            if not old or not new:
+                await update.message.reply_text("Ürün adları boş olamaz.")
+                return
+            pairs.append((old, new))
+        if not pairs:
+            await update.message.reply_text("Düzeltme bulunamadı.")
+            return
+        # Kaynak listedeki adları yalnızca gerçek katalog girdileri arasından kabul et.
+        try:
+            catalog = await asyncio.to_thread(_product_catalog_sync)
+        except Exception:
+            logger.exception("Ürün listesi okunamadı")
+            await update.message.reply_text("Kaynak ürün listesi okunamadı; tekrar dene.")
+            return
+        for old, new in pairs:
+            if _product_key(new) not in catalog:
+                await update.message.reply_text(f"'{new}' Günlük Takip C sütununda bulunmuyor. Tam kaynak adını yaz.")
+                return
+        updated = {**pending, "satirlar": [dict(r) for r in pending["satirlar"]]}
+        for old, new in pairs:
+            found = False
+            for row in updated["satirlar"]:
+                if _product_key(_requested_name(row)) == _product_key(old):
+                    row["Yemek Adı"] = catalog[_product_key(new)][1]
+                    found = True
+            if not found:
+                await update.message.reply_text(f"Bekleyen kayıtlarda '{old}' bulunamadı. Düzeltme uygulanmadı.")
+                return
+        context.user_data["duzeltilecek"] = updated
+        await islem_hazirla(update.message, context, updated)
+        return
     history = context.user_data.setdefault("gecmis", [])
 
     await context.bot.send_chat_action(
