@@ -1,4 +1,5 @@
 import asyncio
+from difflib import SequenceMatcher
 import base64
 import json
 import logging
@@ -388,6 +389,42 @@ def _product_catalog_sync() -> dict:
     return catalog
 
 
+def _find_product(requested: str, catalog: dict):
+    """Önce tam ad, sonra kontrollü kelime/benzerlik eşleşmesi; ilk kayıt kazanır."""
+    key = _product_key(requested)
+    if key in catalog:
+        return catalog[key]
+    if not key:
+        return None
+
+    # Acılı Dana Güveç -> Acılı Güveç gibi fazladan niteleyicileri tolere et.
+    words = set(key.split())
+    candidates = []
+    for position, (candidate_key, value) in enumerate(catalog.items()):
+        other = set(candidate_key.split())
+        common = words & other
+        if not common:
+            continue
+        coverage = len(common) / len(other)
+        similarity = SequenceMatcher(None, key, candidate_key).ratio()
+        # Tek ortak genel kelime ile tamamen farklı yemekleri eşleştirme.
+        if (len(common) >= 2 and coverage >= 0.75) or similarity >= 0.86:
+            score = 0.65 * coverage + 0.35 * similarity
+            candidates.append((score, -position, value, candidate_key))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    best = candidates[0]
+    # Yakın puanlı iki farklı ad varsa yanlış ürünü sessizce seçme.
+    if len(candidates) > 1 and best[0] - candidates[1][0] < 0.045:
+        raise ValueError(
+            f"Ürün eşleşmesi belirsiz: {requested}. "
+            f"Olası ürünler: {best[2][1]}, {candidates[1][2][1]}"
+        )
+    logger.info("Ürün eşleştirildi: %s -> %s", requested, best[2][1])
+    return best[2]
+
+
 def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) -> dict:
     # Sütun adlarını standartlaştır, tanınmayan alanları reddet.
     aliases = { _norm(k): k for k in LISTBOT_HEADERS }
@@ -399,9 +436,9 @@ def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) 
             raise ValueError(f"Tanınmayan sütun: {k}")
         clean[key] = v
     requested = str(clean.get("Yemek Adı") or "").strip()
-    match = catalog.get(_product_key(requested))
+    match = _find_product(requested, catalog)
     if not match:
-        raise ValueError(f"Ürün Günlük Takip C sütununda birebir bulunamadı: {requested}")
+        raise ValueError(f"Ürün Günlük Takip C sütununda güvenilir biçimde eşleştirilemedi: {requested}")
     kind, canonical = match
     clean["Yemek Türü"] = kind
     clean["Yemek Adı"] = canonical
