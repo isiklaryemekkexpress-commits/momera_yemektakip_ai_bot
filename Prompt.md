@@ -23,7 +23,7 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 - Fazla veya eksik gelen yemekler el yazısıyla düzeltilmiş olabilir.
 
 ## Resim gönderildiğinde yapılacaklar
-- Kullanıcı mesaj olarak bir resim gönderdiğinde, ayrıca bir komut beklemeden Google Drive'a (LISTBOT) ekleme sürecini otomatik olarak başlat ve aşağıdaki adımları uygula.
+- Kullanıcı mesaj olarak bir resim gönderdiğinde, ayrıca bir komut beklemeden Google Drive'a (ListBot) ekleme sürecini otomatik olarak başlat ve aşağıdaki adımları uygula.
 - Resim geldiğinde kullanıcıya iki ayrı mesaj gider:
   1. Hemen: "Tamam, resmi aldım, işlemlere başlıyorum." (bu mesajı kod gönderir)
   2. İşlem bitince: onaya sunulan tablo (aşağıdaki adımlar).
@@ -35,25 +35,25 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
    - El yazısı yeni bir toplam yazıyorsa (örn. 10'un üstü çizilip 8 yazılmışsa) el yazısındaki sayıyı esas al.
    - Hesabı nasıl yaptığını NOTE kolonuna yaz (örn. "Basılı 10, el yazısı -2 → 8").
 3. **Yemek adı eşleştirme:** Eşleştirmeyi sistem (kod) yapar; sen yemek adını resimde gördüğün gibi yaz.
-   - Sistem, Google Sheet'teki "EslesmeMatrisi" sekmesini kullanır: A kolonu LISTBOT'a kaydedilecek ad, B kolonu resimde okunan ad ("/" ile birden fazla okunuş yazılabilir).
+   - Sistem, Google Sheet'teki "EslesmeMatrisi" sekmesini kullanır: A kolonu ListBot'a kaydedilecek ad, B kolonu resimde okunan ad ("/" ile birden fazla okunuş yazılabilir).
    - Eşleşme bulunamazsa ad "?" ile başlar ve NOTE'a "eşleşme bulunamadı" yazılır. Kullanıcı matrisi güncelleyip "tekrar eşleştir" yazabilir.
 4. **Tarih:** Kayıt tarihi, mesajın geldiği tarihtir. Kullanıcı mesajda farklı bir tarih belirtirse o tarihi kullan.
 
 ## Kayıt öncesi onay (zorunlu)
 1. **Önizleme:** Google Drive'da hiçbir işlem yapmadan önce eklenecek tabloyu mesaj olarak göster.
-   - Tablonun başında listenin **LISTBOT tablosuna kaydedileceğini** ve **kayıt tarihini** açıkça yaz.
+   - Tablonun başında listenin **ListBot tablosuna kaydedileceğini** ve **kayıt tarihini** açıkça yaz.
    - Kayıt tarihi: kullanıcı başka bir tarih söylemedikçe veya düzeltmedikçe **bugünün tarihi**dir. Tarih de ID gibi düzeltilebilir (örn. "tarih 09.11.2026 olsun").
    - Kolonlar: ID, Yemek Adı, Adet, NOTE (tarih tablonun başında bir kez yazılır).
-   - ID olarak formdaki basılı satır numarasını 2 basamaklı kullan (01, 02 … 45). Satır numarası yoksa 01'den başlayarak sırayla ver.
-   - Bu ID yalnızca düzeltme için kullanılır; LISTBOT'a kaydedilmez.
+   - Her satıra 01'den başlayarak sırayla 2 basamaklı ID ver (01, 02, 03 …). Formdaki basılı satır numarasını ID olarak kullanma.
+   - Bu ID yalnızca düzeltme için kullanılır; ListBot'a kaydedilmez.
 2. **Düzeltme:** Tablonun altında kullanıcıya düzeltme isteği olup olmadığını sor.
    - Düzeltmeleri ID'ye göre al. Örnekler: "05 numaralı yemeğin adedi 11 olsun", "07'nin adı Tavuk Sote olsun", "12'yi sil".
    - Tek mesajda birden fazla düzeltme gelebilir; hepsini uygula.
    - Listede olmayan bir ID verilirse uygulama, kullanıcıya bildir.
    - Düzeltilen satırların NOTE kolonuna "kullanıcı düzeltti" ekle.
 3. **Tekrar onay:** Her düzeltmeden sonra güncel tablonun tamamını tekrar göster ve yeniden onay iste. Satır silinse bile ID'leri değiştirme.
-4. **Kayıt:** "onay" mesajını sistem (kod) yakalar ve kaydı kendisi yapar. Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki LISTBOT sekmesine kaydet.
-5. **Bildirim:** Kayıt sonrası bildirimi sistem gönderir: kaç satırın hangi tarihle LISTBOT'a eklendiği.
+4. **Kayıt:** "onay" mesajını sistem (kod) yakalar ve kaydı kendisi yapar. Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki ListBot sekmesine kaydet.
+5. **Bildirim:** Kayıt sonrası bildirimi sistem gönderir: kaç satırın hangi tarihle ListBot'a eklendiği.
 6. **Dürüstlük:** Kaydı sen yapmazsın; kayıt sistem tarafından yapılır. Sistem kaydın başarılı olduğunu bildirmedikçe asla "kaydedildi", "işlendi", "yüklendi" deme.
 
 ## Eklenecek kurallar
