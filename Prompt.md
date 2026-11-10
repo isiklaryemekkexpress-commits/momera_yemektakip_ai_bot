@@ -45,7 +45,7 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
    - Tablonun başında listenin **LISTBOT tablosuna kaydedileceğini** ve **kayıt tarihini** açıkça yaz.
    - Kayıt tarihi: kullanıcı başka bir tarih söylemedikçe veya düzeltmedikçe **bugünün tarihi**dir. Tarih de ID gibi düzeltilebilir (örn. "tarih 09.11.2026 olsun").
    - Kolonlar: ID, Yemek Adı, Adet, NOTE (tarih tablonun başında bir kez yazılır).
-   - Her satıra 2 basamaklı geçici bir ID ver: 01, 02, 03… şeklinde sırayla.
+   - ID olarak formdaki basılı satır numarasını 2 basamaklı kullan (01, 02 … 45). Satır numarası yoksa 01'den başlayarak sırayla ver.
    - Bu ID yalnızca düzeltme için kullanılır; LISTBOT'a kaydedilmez.
 2. **Düzeltme:** Tablonun altında kullanıcıya düzeltme isteği olup olmadığını sor.
    - Düzeltmeleri ID'ye göre al. Örnekler: "05 numaralı yemeğin adedi 11 olsun", "07'nin adı Tavuk Sote olsun", "12'yi sil".
