@@ -1,5 +1,9 @@
 import asyncio
 import base64
+import json
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -28,46 +32,40 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # AYARLAR — model ve davranış ayarları burada, kodun içinde.
 # Render > Environment'ta yalnızca gizli anahtarlar durur:
-#   TELEGRAM_BOT_TOKEN ve seçili sağlayıcının anahtarı
-#   (groq -> GROQ_API_KEY, grok -> GROK_API_KEY, evren -> EVREN_API_KEY)
-#   WEBHOOK_SECRET opsiyonel
+#   TELEGRAM_BOT_TOKEN, GROQ_API_KEY, EVREN_API_KEY (WEBHOOK_SECRET opsiyonel)
 # ============================================================
 
-# Kullanılacak sağlayıcı: "groq", "grok" ya da "evren"
-# DİKKAT: Groq (groq.com, anahtar "gsk_" ile başlar) ile
-#         Grok (xAI, anahtar "xai-" ile başlar) farklı şirketlerdir.
-PROVIDER = "groq"
-
+# Sağlayıcılar. Anahtarı Render'da tanımlı olanlar kullanılır.
+# DİKKAT: Groq (groq.com, "gsk_") ile Grok (xAI, "xai-") farklı şirketlerdir.
 PROVIDERS = {
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "key_env": "GROQ_API_KEY",
-        "text_model": "qwen/qwen3.8-27b",
-        # Groq'ta resim okuyabilen model (önizleme; kaldırılırsa burayı güncelleyin)
-        "vision_models": ["qwen/qwen3.8-27b"],
-    },
-    "grok": {
-        "base_url": "https://api.x.ai/v1",
-        "key_env": "GROK_API_KEY",
-        # Metin mesajları (düzeltme, onay, sorular) için model
-        "text_model": "grok-4",
-        # Resim okuma modelleri — sırayla denenir; ilki hata verirse sonrakine geçilir
-        "vision_models": ["grok-4"],
-    },
-    "evren": {
-        "base_url": "https://evren-llmapi.ssyz.org.tr/v1",
-        "key_env": "EVREN_API_KEY",
-        "text_model": "deepseek-v4.1-flash",
-        "vision_models": ["gemma-4-31b", "qwen3-vl-30b", "deepseek-v4.1-flash"],
-    },
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY"},
+    "evren": {"base_url": "https://evren-llmapi.ssyz.org.tr/v1", "key_env": "EVREN_API_KEY"},
+    "grok": {"base_url": "https://api.x.ai/v1", "key_env": "GROK_API_KEY"},
 }
 
-CFG = PROVIDERS[PROVIDER]
-TEXT_MODEL = CFG["text_model"]
-VISION_MODELS = CFG["vision_models"]
+# Model sıraları: (sağlayıcı, model, max_tokens). Yukarıdan aşağı denenir;
+# biri hata verirse (limit, dolu, yanıt yarım kaldı) sıradakine geçilir.
+# Groq ücretsiz katmanında dakikada 1000 çıktı token sınırı var, bu yüzden
+# max_tokens 1000'in altında tutuluyor; uzun listelerde EVREN devreye girer.
+TEXT_CHAIN = [
+    ("groq", "qwen/qwen3.8-27b", 900),
+    ("evren", "deepseek-v4.1-flash", 4096),
+]
+VISION_CHAIN = [
+    ("groq", "qwen/qwen3.8-27b", 900),
+    ("evren", "gemma-4-31b", 4096),      # el yazısı çözümleme
+    ("evren", "qwen3-vl-30b", 4096),     # tablo / belge okuma
+    ("evren", "deepseek-v4.1-flash", 4096),
+]
 
-# Yanıt için token bütçesi (düşünen modellerde düşünme de bu bütçeden harcanır)
-MAX_TOKENS = 4096
+# --- Google Sheets ---
+# Tablonun adresindeki ID: docs.google.com/spreadsheets/d/<BURASI>/edit
+SPREADSHEET_ID = ""  # TODO: Google Sheet ID'sini buraya yazın
+LISTBOT_SHEET = "LISTBOT"
+TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+# Kullanıcı bunlardan birini yazarsa liste kaydedilir (kod kontrol eder, yapay zeka değil)
+APPROVAL_WORDS = {"onay", "onayla", "onaylıyorum", "onaylandı", "kaydet", "evet kaydet", "tamam kaydet"}
 
 # Sohbet geçmişinde tutulacak en fazla mesaj sayısı (kullanıcı + bot)
 MAX_HISTORY = 20
@@ -83,12 +81,6 @@ PROGRESS_TEXT = "Çalışmaya devam ediyorum, lütfen bekleyin..."
 
 # --- Gizli anahtarlar (Render > Environment) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-API_KEY = os.environ.get(CFG["key_env"])
-if not API_KEY:
-    raise RuntimeError(
-        f"Render > Environment'ta {CFG['key_env']} bulunamadı "
-        f"(PROVIDER = {PROVIDER!r}). Değişkeni ekleyin ya da PROVIDER'ı değiştirin."
-    )
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
 
 # --- Render'ın kendisinin otomatik verdiği değerler (elle girilmez) ---
@@ -114,16 +106,32 @@ def load_system_prompt() -> str:
 
 SYSTEM_PROMPT = load_system_prompt()
 
-client = AsyncOpenAI(
-    api_key=API_KEY,
-    base_url=CFG["base_url"],
-    # EVREN anahtarı ayrıca X-API-Key başlığıyla da beklenir
-    default_headers={"X-API-Key": API_KEY} if PROVIDER == "evren" else None,
-)
-logger.info(
-    "Sağlayıcı: %s — metin modeli: %s, resim modelleri: %s",
-    PROVIDER, TEXT_MODEL, VISION_MODELS,
-)
+def build_clients() -> dict[str, AsyncOpenAI]:
+    """Render'da anahtarı olan her sağlayıcı için istemci oluşturur."""
+    clients = {}
+    for name, cfg in PROVIDERS.items():
+        key = os.environ.get(cfg["key_env"])
+        if not key:
+            continue
+        clients[name] = AsyncOpenAI(
+            api_key=key,
+            base_url=cfg["base_url"],
+            # EVREN anahtarı ayrıca X-API-Key başlığıyla da beklenir
+            default_headers={"X-API-Key": key} if name == "evren" else None,
+        )
+    return clients
+
+
+CLIENTS = build_clients()
+TEXT_CHAIN = [c for c in TEXT_CHAIN if c[0] in CLIENTS]
+VISION_CHAIN = [c for c in VISION_CHAIN if c[0] in CLIENTS]
+if not TEXT_CHAIN or not VISION_CHAIN:
+    raise RuntimeError(
+        "Kullanılabilir yapay zeka anahtarı yok. Render > Environment'a "
+        "GROQ_API_KEY veya EVREN_API_KEY ekleyin."
+    )
+logger.info("Metin modelleri: %s", [f"{p}/{m}" for p, m, _ in TEXT_CHAIN])
+logger.info("Resim modelleri: %s", [f"{p}/{m}" for p, m, _ in VISION_CHAIN])
 
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -154,30 +162,40 @@ def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
     del history[:-MAX_HISTORY]
 
 
-async def ask_llm(model: str, history: list[dict], user_content) -> str:
+class IncompleteReply(Exception):
+    """Model yanıtı token sınırına takılıp yarım kaldı."""
+
+
+async def ask_llm(provider: str, model: str, max_tokens: int,
+                  history: list[dict], user_content) -> str:
     """Kurallar + geçmiş + yeni mesajı yapay zekaya gönderir."""
-    response = await client.chat.completions.create(
+    response = await CLIENTS[provider].chat.completions.create(
         model=model,
-        max_tokens=MAX_TOKENS,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             *history,
             {"role": "user", "content": user_content},
         ],
     )
-    return response.choices[0].message.content or "Bir yanıt üretilemedi."
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        raise IncompleteReply(f"yanıt {max_tokens} token sınırında yarım kaldı")
+    if not choice.message.content:
+        raise IncompleteReply("boş yanıt")
+    return choice.message.content
 
 
-async def ask_vision(history: list[dict], user_content) -> str:
-    """Resim modellerini sırayla dener; ilk başarılı yanıtı döndürür."""
+async def ask_chain(chain: list[tuple], history: list[dict], user_content) -> str:
+    """Modelleri sırayla dener; ilk tam yanıtı döndürür."""
     last_error = None
-    for model in VISION_MODELS:
+    for provider, model, max_tokens in chain:
         try:
-            reply = await ask_llm(model, history, user_content)
-            logger.info("Resim okundu (model: %s)", model)
+            reply = await ask_llm(provider, model, max_tokens, history, user_content)
+            logger.info("Yanıt alındı: %s/%s", provider, model)
             return reply
         except Exception as e:
-            logger.warning("Resim modeli başarısız (%s): %s — sıradakine geçiliyor", model, e)
+            logger.warning("%s/%s başarısız: %s — sıradakine geçiliyor", provider, model, e)
             last_error = e
     raise last_error
 
@@ -219,32 +237,116 @@ async def send_reply(update: Update, text: str):
         await update.message.reply_text(part)
 
 
+def today_str() -> str:
+    return datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+
+
 def message_header(update: Update) -> str:
     """Mesaj tarihini yapay zekaya iletir (kayıt tarihi için gerekli)."""
     msg = update.message
-    tarih = msg.date.astimezone().strftime("%d.%m.%Y %H:%M")
+    tarih = msg.date.astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
     gonderen = msg.from_user.full_name if msg.from_user else "Bilinmiyor"
-    return f"[Mesaj tarihi: {tarih} | Gönderen: {gonderen}]"
+    return f"[Mesaj tarihi: {tarih} | Bugünün tarihi: {today_str()} | Gönderen: {gonderen}]"
 
 
-# Resim gelince modele verilen kesin talimat. Kurallar dosyası yüklenemese
-# bile botun tabloyu gösterip onay istemesini garanti eder.
-PHOTO_INSTRUCTION = """Kullanıcı yemek listesi resmi gönderdi. Kurallardaki 'Resim gönderildiğinde yapılacaklar' ve 'Kayıt öncesi onay' adımlarını uygula.
+# Önizleme tablosunun biçimi. Kod onay gelince bu biçimi okuyup Sheets'e yazar,
+# bu yüzden yapay zeka her tabloyu tam olarak böyle göstermelidir.
+TABLE_FORMAT = """Tabloyu tam olarak şu biçimde göster (her satır ayrı, sütunlar " | " ile ayrılmış):
 
-ÖNEMLİ:
-- Şu an SADECE önizleme hazırlıyorsun. Hiçbir yere kayıt yapmadın ve yapamazsın; kayıt, kullanıcı onay verdikten sonra sistem tarafından yapılır.
-- "kaydedildi", "işlendi", "yüklendi" gibi ifadeler KULLANMA.
-- Resimdeki her yemek satırını tek tek yaz; özet verme.
-
-Yanıtını tam olarak şu biçimde ver:
-
-📋 Okunan liste (Tarih: GG.AA.YYYY)
+📋 LISTBOT tablosuna kaydedilecek liste
+📅 Kayıt tarihi: GG.AA.YYYY
 
 ID | Yemek Adı | Adet | NOTE
 01 | <yemek adı> | <adet> | <hesap / not>
 02 | ...
 
-Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05'in adedi 11 olsun"). Liste doğruysa "onay" yazın."""
+Toplam: <satır sayısı> satır
+Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05'in adedi 11 olsun", "tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste LISTBOT tablosuna yukarıdaki tarihle kaydedilecek.
+
+Kayıt tarihi kuralı: Kullanıcı başka bir tarih söylemedikçe veya düzeltmedikçe bugünün tarihini kullan."""
+
+PHOTO_INSTRUCTION = """Kullanıcı yemek listesi resmi gönderdi. Kurallardaki 'Resim gönderildiğinde yapılacaklar' ve 'Kayıt öncesi onay' adımlarını uygula.
+
+ÖNEMLİ:
+- Şu an SADECE önizleme hazırlıyorsun. Kayıt, kullanıcı "onay" yazınca sistem tarafından yapılır.
+- "kaydedildi", "işlendi", "yüklendi", "onaylandı" gibi ifadeler KULLANMA.
+- Resimdeki her yemek satırını tek tek yaz; özet verme.
+
+""" + TABLE_FORMAT
+
+EDIT_INSTRUCTION = """[Sistem notu: Onay bekleyen bir liste var. Kullanıcı düzeltme istediyse uygula ve güncel tablonun TAMAMINI aşağıdaki biçimde tekrar göster. Kayıt yapıldığını ya da liste onaylandığını söyleme.]
+
+""" + TABLE_FORMAT
+
+
+# --- Tabloyu metinden okuma ---
+ROW_RE = re.compile(r"^\s*\**\s*(\d{1,3})\s*\**\s*\|\s*(.*?)\s*\|\s*(.*?)\s*(?:\|\s*(.*?)\s*)?\|?\s*$")
+DATE_RE = re.compile(r"Kayıt tarihi:\s*\**\s*(\d{1,2}[./]\d{1,2}[./]\d{4})", re.IGNORECASE)
+
+
+def parse_table(text: str):
+    """Önizleme mesajından (tarih, satırlar) çıkarır. Tablo yoksa None döner."""
+    rows = []
+    for line in text.splitlines():
+        m = ROW_RE.match(line)
+        if not m:
+            continue
+        _id, name, qty, note = m.groups()
+        name = name.strip("* ")
+        if not name or name.lower().startswith("yemek adı"):
+            continue
+        qty = qty.strip("* ")
+        qty_digits = re.sub(r"[^\d]", "", qty)
+        rows.append({
+            "id": _id.zfill(2),
+            "name": name,
+            "qty": int(qty_digits) if qty_digits else "",
+            "note": (note or "").strip("* "),
+        })
+    if not rows:
+        return None
+    m = DATE_RE.search(text)
+    date = m.group(1).replace("/", ".") if m else today_str()
+    return date, rows
+
+
+# --- Google Sheets ---
+HEADER_ALIASES = {
+    "tarih": "date", "date": "date",
+    "yemek adı": "name", "yemek adi": "name", "yemek": "name",
+    "adet": "qty", "sayı": "qty", "sayi": "qty", "miktar": "qty",
+    "note": "note", "not": "note", "notlar": "note", "açıklama": "note",
+}
+_gc = None
+
+
+def sheets_client():
+    global _gc
+    if _gc is None:
+        import gspread  # requirements.txt: gspread
+        creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if not creds:
+            raise RuntimeError("Render > Environment'ta GOOGLE_CREDENTIALS_JSON yok.")
+        _gc = gspread.service_account_from_dict(json.loads(creds))
+    return _gc
+
+
+def append_to_listbot(date: str, rows: list[dict]) -> int:
+    """Satırları LISTBOT sekmesine ekler. Sütunları başlık satırına göre eşleştirir."""
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Kodda SPREADSHEET_ID boş.")
+    ws = sheets_client().open_by_key(SPREADSHEET_ID).worksheet(LISTBOT_SHEET)
+    header = ws.row_values(1)
+    if not header:
+        header = ["Tarih", "Yemek Adı", "Adet", "NOTE"]
+        ws.append_row(header)
+    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    values = []
+    for r in rows:
+        data = {"date": date, "name": r["name"], "qty": r["qty"], "note": r["note"]}
+        values.append([data.get(k, "") if k else "" for k in keys])
+    ws.append_rows(values, value_input_option="USER_ENTERED")
+    return len(values)
 
 
 # --- Komutlar ---
@@ -257,24 +359,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/yeni komutu: sohbet geçmişini temizler."""
+    """/yeni komutu: sohbet geçmişini ve bekleyen listeyi temizler."""
     context.chat_data["history"] = []
+    context.chat_data.pop("pending", None)
     await update.message.reply_text("Sohbet geçmişi temizlendi. Yeni işleme başlayabilirsiniz.")
+
+
+def remember_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str):
+    """Yanıtta tablo varsa onay bekleyen liste olarak saklar."""
+    parsed = parse_table(reply_text)
+    if parsed:
+        context.chat_data["pending"] = parsed
+
+
+# --- Onay ve kayıt (yapay zeka değil, kod yapar) ---
+async def save_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.chat_data.get("pending")
+    if not pending:
+        await update.message.reply_text(
+            "Onay bekleyen bir liste yok. Önce yemek listesinin fotoğrafını gönderin."
+        )
+        return
+    date, rows = pending
+    await update.message.reply_text(
+        f"Onay alındı. {len(rows)} satır {date} tarihiyle LISTBOT tablosuna kaydediliyor..."
+    )
+    try:
+        count = await asyncio.to_thread(append_to_listbot, date, rows)
+    except Exception as e:
+        logger.exception("LISTBOT kaydı başarısız")
+        await update.message.reply_text(
+            f"❌ Kayıt yapılamadı, LISTBOT tablosuna hiçbir şey eklenmedi.\nHata: {e}\n"
+            "Liste hâlâ onay bekliyor; sorun giderilince tekrar \"onay\" yazabilirsiniz."
+        )
+        return
+    context.chat_data.pop("pending", None)
+    msg = f"✅ Kayıt tamamlandı: {count} satır {date} tarihiyle LISTBOT tablosuna eklendi."
+    add_to_history(context, "assistant", f"[Sistem] {msg}")
+    await update.message.reply_text(msg)
 
 
 # --- Metin mesajları ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kullanıcıdan gelen metni geçmişle birlikte yapay zekaya iletir."""
-    user_text = f"{message_header(update)}\n{update.message.text}"
+    text = update.message.text.strip()
+    if text.lower().rstrip(".!") in APPROVAL_WORDS:
+        await save_pending(update, context)
+        return
+
+    user_text = f"{message_header(update)}\n{text}"
+    model_text = user_text
+    if context.chat_data.get("pending"):
+        model_text = f"{user_text}\n\n{EDIT_INSTRUCTION}"
 
     try:
         async with keep_alive(update, context):
-            reply_text = await ask_llm(TEXT_MODEL, get_history(context), user_text)
+            reply_text = await ask_chain(TEXT_CHAIN, get_history(context), model_text)
     except Exception:
-        logger.exception("Yapay zeka çağrısında hata oluştu (model: %s)", TEXT_MODEL)
+        logger.exception("Hiçbir metin modeli yanıt veremedi")
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
+    remember_table(context, reply_text)
     add_to_history(context, "user", user_text)
     add_to_history(context, "assistant", reply_text)
     await send_reply(update, reply_text)
@@ -300,25 +446,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_b64 = base64.b64encode(img_bytes).decode()
 
     caption = msg.caption or ""
-    user_text = (
-        f"{message_header(update)}\n"
-        f"Kullanıcının notu: {caption or '(yok)'}\n\n"
-        + PHOTO_INSTRUCTION
-    )
+    user_text = f"{message_header(update)}\nKullanıcının notu: {caption or '(yok)'}"
     user_content = [
-        {"type": "text", "text": user_text},
+        {"type": "text", "text": f"{user_text}\n\n{PHOTO_INSTRUCTION}"},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
     ]
 
     try:
         async with keep_alive(update, context):
-            reply_text = await ask_vision(get_history(context), user_content)
+            reply_text = await ask_chain(VISION_CHAIN, get_history(context), user_content)
     except Exception:
-        logger.exception("Hiçbir resim modeli yanıt veremedi: %s", VISION_MODELS)
+        logger.exception("Hiçbir resim modeli yanıt veremedi")
         await msg.reply_text(
             "Üzgünüm, resmi işlerken bir hata oluştu. Lütfen tekrar deneyin."
         )
         return
+
+    # Yeni resim önceki bekleyen listeyi değiştirir
+    context.chat_data.pop("pending", None)
+    remember_table(context, reply_text)
 
     # Geçmişe resmin kendisi değil, sadece metni yazılır (boyut büyümesin diye)
     add_to_history(context, "user", f"{user_text}\n[Resim gönderildi]")
