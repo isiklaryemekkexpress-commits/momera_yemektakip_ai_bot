@@ -1,23 +1,11 @@
-import asyncio
-from difflib import SequenceMatcher
-import base64
-import json
 import logging
 import os
-import re
-import time
-from datetime import datetime, date as calendar_date
-from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
-import httpx
-from google.auth.transport.requests import AuthorizedSession
-from google.oauth2 import service_account
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from openai import AsyncOpenAI
+from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -33,231 +21,57 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Ayarlar (hepsi Render > Environment'tan okunur) ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-# Groq'un resim okuyabilen güncel modeli. Değişirse Render'da GROQ_MODEL ile güncelle.
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
-GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-SHEET_NAME = os.environ.get("SHEET_NAME", "yemekkexpress_yemektakip_AI")
-SHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
-SHEET_TAB_NAME = "ListBot"  # Yalnızca bu sekmeye yazılır
-SOURCE_TAB_NAME = "Günlük Takip"  # Ürün adları C5:C ve türleri B5:B
-# Boş bırakılırsa herkes kullanabilir. Doluysa virgülle ayrılmış Telegram kullanıcı ID'leri.
-ALLOWED_USER_IDS = {
-    int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
-}
-
+# --- Genel ayarlar (Render > Environment sekmesinden gelir, koda yazılmaz) ---
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
 PORT = int(os.environ.get("PORT", "10000"))
+# Render bu değişkeni otomatik verir (ör. https://momera-yemektakip-ai-bot.onrender.com)
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-TELEGRAM_MAX_LEN = 4096
-MAX_IMAGE_BYTES = 3_500_000
-HISTORY_LIMIT = 10
-TIMEZONE = ZoneInfo("Europe/Istanbul")
-
-SHEETS_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-
-BASE_SYSTEM_PROMPT = (
+SYSTEM_PROMPT = (
     "Sen Momera Yemek Takip yapay zeka asistanısın. "
-    "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver. "
-    f"Bir Google Sheets tablosuna ('{SHEET_NAME}') bağlısın: tablonun içeriğini okuyabilir, "
-    "sorulara tablodaki verilere dayanarak cevap verebilir, fotoğraftaki bilgileri tabloya "
-    "satır olarak ekleyebilir ve kullanıcı isterse tabloya yazı yazabilirsin. "
-    "Her yazma işlemi izin kurallarına ve çoğunlukla kullanıcı onayına tabidir. "
-    "Satır ya da veri silemezsin."
+    "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver."
 )
 
+TELEGRAM_MAX_LEN = 4096
 
-def load_rules() -> str:
-    """Konuşma kurallarını kurallar.md dosyasından okur."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kurallar.md")
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        logger.warning("kurallar.md bulunamadı, yalnızca temel istem kullanılacak.")
-        return ""
+# --- Yapay zeka sağlayıcısı seçimi ---
+# Render'da LLM_PROVIDER = evren  ya da  grok  yazarak seçersin (varsayılan: evren).
+# İkisi de OpenAI uyumlu olduğu için aynı kütüphane ile çalışır.
+# LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "grok").strip().lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "evren").strip().lower()
 
 
-RULES = load_rules()
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + ("\n\nKurallar:\n" + RULES if RULES else "")
-
-EXTRACT_PROMPT = (
-    SYSTEM_PROMPT
-    + "\n\nFotoğraftaki yemek ve miktar bilgilerini çıkar. "
-    "Yalnızca geçerli JSON ver: "
-    '{"ozet":"kısa özet","satirlar":[{"Yemek Adı":"...","Gelen Adet":"...","Satılan Adet":"...","Fire":"...","Stok":"...","Devreden":"...","Notes":"..."}]}. '
-    "Fotoğrafta bulunmayan alanları boş bırak. Her yemek ayrı satırdır. "
-    "Her yemek satırındaki 6 fazla geldi, 3 eksik geldi, geç geldi, iade gibi açıklamaları "
-    "aynen o satırın Notes alanına yaz. Açıklamaları miktar veya yemek adına ekleme. "
-    "Notes sadece açıkça görülen veya kullanıcı tarafından belirtilen açıklama olsun; tahmin etme. "
-    "Yemek isimlerini tahmin ederek düzeltme; kod kaynak tablodan doğrulayacak. "
-    "Tarih, No ve Eklenme Zamanı alanlarını satırlara ekleme. "
-    "Fotoğrafta açıkça yazan tarihi varsa JSON üst düzeyinde tarih alanında DD.MM.YYYY olarak belirt. "
-    "Fotoğrafta görünür bütün yemekleri sırasıyla çıkar; porsiyon sayılarını Gelen Adet alanına yaz. "
-    "Kullanıcı açıklamasındaki tarih fotoğraftaki tarihten önceliklidir. "
-    "Eklenme Zamanı S sütununa, Notes T sütununa kaydedilir. "
-    "J:R hesaplama sütunlarına veri üretme."
-)
-
-
-# --------------------------------------------------------- Tarih / kullanıcı talimatı
-DATE_FULL_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
-DATE_DAY_RE = re.compile(r"(?:tarih(?:i|e)?|gün(?:ü|e)?)\s*(?:olarak\s*)?(\d{1,2})(?![\d./-])", re.I)
-FIRST_ROWS_RE = re.compile(r"(?:ilk|baştaki|bastaki)\s+(\d{1,3})\s*(?:satır|satiri|satırı|yemek|ürün|urun|kayıt|kayit)?", re.I)
+def build_client() -> tuple[AsyncOpenAI, str]:
+    """Seçilen sağlayıcıya göre istemciyi ve model adını döndürür."""
+    if LLM_PROVIDER == "evren":
+        api_key = os.environ["EVREN_API_KEY"]
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=os.environ.get("EVREN_BASE_URL", "https://evren-llmapi.ssyz.org.tr/v1"),
+            # EVREN anahtarı X-API-Key başlığıyla beklenir
+            default_headers={"X-API-Key": api_key},
+        )
+        # "auto": platform modeli kendisi seçer. İstersen model adı yaz (örn. glm-5.3)
+        model = os.environ.get("EVREN_MODEL", "auto")
+    elif LLM_PROVIDER == "grok":
+        client = AsyncOpenAI(
+            api_key=os.environ["GROK_API_KEY"],
+            base_url=os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1"),
+        )
+        # Model adını console.x.ai'daki güncel listeden kontrol et
+        model = os.environ.get("GROK_MODEL", "grok-4")
+    else:
+        raise RuntimeError(
+            f"Geçersiz LLM_PROVIDER: {LLM_PROVIDER!r}. 'evren' ya da 'grok' olmalı."
+        )
+    return client, model
 
 
-def _valid_date(day: int, month: int, year: int) -> str:
-    try:
-        return calendar_date(year, month, day).strftime("%d.%m.%Y")
-    except ValueError as exc:
-        raise ValueError(f"Geçersiz tarih: {day:02d}.{month:02d}.{year}") from exc
+client, MODEL = build_client()
+logger.info("Yapay zeka sağlayıcısı: %s, model: %s", LLM_PROVIDER, MODEL)
 
 
-def _date_from_text(text: str, reference: str = "") -> str | None:
-    """Tam tarih veya 'tarih 02' gibi gün düzeltmesi; tarih yoksa None."""
-    text = str(text or "")
-    match = DATE_FULL_RE.search(text)
-    if match:
-        return _valid_date(*map(int, match.groups()))
-    match = DATE_DAY_RE.search(text)
-    if match:
-        base = DATE_FULL_RE.search(str(reference or ""))
-        if base:
-            _, month, year = map(int, base.groups())
-        else:
-            today = datetime.now(TIMEZONE)
-            month, year = today.month, today.year
-        return _valid_date(int(match.group(1)), month, year)
-    return None
-
-
-def _first_rows_from_text(text: str) -> int | None:
-    match = FIRST_ROWS_RE.search(str(text or ""))
-    return int(match.group(1)) if match else None
-
-
-def _is_instruction_update(text: str) -> bool:
-    """Bekleyen fotoğraf kaydına uygulanacak kısa tarih/adet/satır talimatı."""
-    t = _norm(text)
-    return bool(_date_from_text(text) or _first_rows_from_text(text)) and (
-        len(text) < 180 and ("tarih" in t or "ilk " in t or "gun" in t)
-    )
-
-
-def _apply_user_constraints(action: dict, instruction: str, photo_date: str = "") -> dict:
-    """Kullanıcının yazdığı tarih ve satır sınırını AI çıktısından bağımsız uygula."""
-    action = dict(action)
-    if action.get("tip") != "satir_ekle":
-        return action
-    rows = [dict(row) for row in action.get("satirlar", []) if isinstance(row, dict)]
-    date = _date_from_text(instruction, photo_date or str(action.get("_tarih", "")))
-    if date:
-        action["_tarih"] = date
-        action["_tarih_kaynagi"] = "kullanıcı"
-    elif photo_date and not action.get("_tarih"):
-        action["_tarih"] = _date_from_text(photo_date)
-        action["_tarih_kaynagi"] = "fotoğraf"
-    count = _first_rows_from_text(instruction)
-    if count is not None:
-        if count < 1:
-            raise ValueError("Satır sayısı 1 veya daha büyük olmalı.")
-        action["_limit"] = count
-    if action.get("_limit") is not None:
-        rows = rows[:int(action["_limit"])]
-    action["satirlar"] = rows
-    return action
-
-
-# ------------------------------------------------------------ Yazma izinleri
-def _norm(s) -> str:
-    """Türkçe karakterleri sadeleştirip küçük harfe çevirir (karşılaştırma için)."""
-    return str(s).strip().translate(str.maketrans("ıİşŞğĞüÜöÖçÇ", "iissgguuoocc")).lower()
-
-
-def _liste(value: str) -> list[str]:
-    return [x.strip() for x in re.split(r"[,;]", value) if x.strip()]
-
-
-def _bos_mu(value: str) -> bool:
-    return _norm(value) in ("", "yok", "hicbiri", "hepsi", "tumu", "-")
-
-
-def load_permissions(rules: str) -> dict:
-    """kurallar.md içindeki '## Yazma izinleri' bölümünü okur. Bu sınırlar kodda uygulanır."""
-    perm = {
-        "yazma": True,
-        "izinli_islemler": {"satir_ekle", "hucre_yaz"},
-        "korumali_sutunlar": set(),
-        "yazilabilir_sutunlar": set(),  # boşsa sütun kısıtı yok
-        "korumali_satirlar": {1},
-        "onay": True,
-        "en_fazla_satir": 10,
-    }
-    in_section = False
-    for raw in rules.splitlines():
-        line = raw.strip()
-        if line.startswith("#"):
-            in_section = _norm(line.lstrip("# ")).startswith("yazma izinleri")
-            continue
-        if not in_section:
-            continue
-        line = line.lstrip("-* ").strip()
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = _norm(key).replace(" ", "_")
-        value = value.strip()
-        if key == "yazma":
-            perm["yazma"] = _norm(value) in ("acik", "evet", "true", "on", "1")
-        elif key == "izinli_islemler":
-            perm["izinli_islemler"] = (
-                set()
-                if _norm(value) in ("yok", "hicbiri", "-")
-                else {_norm(x).replace(" ", "_") for x in _liste(value)}
-            )
-        elif key == "korumali_sutunlar":
-            perm["korumali_sutunlar"] = set() if _bos_mu(value) else {_norm(x) for x in _liste(value)}
-        elif key == "yazilabilir_sutunlar":
-            perm["yazilabilir_sutunlar"] = set() if _bos_mu(value) else {_norm(x) for x in _liste(value)}
-        elif key == "korumali_satirlar":
-            perm["korumali_satirlar"] = {int(x) for x in _liste(value) if x.isdigit()}
-        elif key == "onay":
-            perm["onay"] = _norm(value) not in ("gerekmez", "yok", "hayir", "kapali")
-        elif key == "en_fazla_satir" and value.isdigit():
-            perm["en_fazla_satir"] = max(1, int(value))
-    return perm
-
-
-PERMS = load_permissions(RULES)
-
-
-def izin_ozeti() -> str:
-    if not PERMS["yazma"]:
-        return "Yazma işlemleri kapalı; hiçbir yazma işlemi üretme."
-    parcalar = [
-        "Yazma açık",
-        "izinli işlemler: " + (", ".join(sorted(PERMS["izinli_islemler"])) or "yok"),
-        "onay: " + ("gerekli" if PERMS["onay"] else "gerekmez"),
-        f"tek seferde en fazla {PERMS['en_fazla_satir']} satır",
-    ]
-    if PERMS["korumali_sutunlar"]:
-        parcalar.append("korumalı sütunlar: " + ", ".join(sorted(PERMS["korumali_sutunlar"])))
-    if PERMS["yazilabilir_sutunlar"]:
-        parcalar.append("yalnızca şu sütunlara yazılabilir: " + ", ".join(sorted(PERMS["yazilabilir_sutunlar"])))
-    if PERMS["korumali_satirlar"]:
-        parcalar.append("korumalı satırlar: " + ", ".join(str(x) for x in sorted(PERMS["korumali_satirlar"])))
-    return "; ".join(parcalar)
-
-
-# ---------------------------------------------------------------- Yardımcılar
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     """Telegram 4096 karakter sınırı için uzun yanıtları parçalara böler."""
     parts = []
@@ -272,847 +86,45 @@ def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return parts
 
 
-async def izinli_mi(update: Update) -> bool:
-    """ALLOWED_USER_IDS tanımlıysa yalnızca listedeki kullanıcılara izin verir."""
-    if not ALLOWED_USER_IDS:
-        return True
-    user = update.effective_user
-    if user and user.id in ALLOWED_USER_IDS:
-        return True
-    logger.warning("Yetkisiz kullanıcı engellendi: %s", user.id if user else "?")
-    if update.effective_message:
-        await update.effective_message.reply_text("Bu botu kullanma yetkiniz yok.")
-    return False
-
-
-# ------------------------------------------------------------------- Groq
-async def groq_chat(messages: list[dict], model: str, json_mode: bool = False) -> str:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-        # Ücretsiz katmanda dakikada 1000 çıktı tokenı sınırı var; isteği buna göre kısıtla.
-        "max_completion_tokens": 2400 if json_mode else 700,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    async with httpx.AsyncClient(timeout=120) as http:
-        resp = await http.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json=payload,
-        )
-    if resp.status_code >= 400:
-        logger.error("Groq hatası %s: %s", resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-    text = resp.json()["choices"][0]["message"].get("content") or ""
-    # Bazı modeller düşünme bloğunu da döndürür; kullanıcıya göstermiyoruz.
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-
-
-def parse_json(text: str) -> dict:
-    text = text.strip()
-    fence = chr(96) * 3
-    if text.startswith(fence):
-        text = text.strip(chr(96)).strip()
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-    return json.loads(text)
-
-
-# ------------------------------------------------------------- Google Sheets
-_session = None
-_sheet_cache: dict = {}
-
-
-def _session_get() -> AuthorizedSession:
-    global _session
-    if _session is None:
-        info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=SHEETS_SCOPES
-        )
-        _session = AuthorizedSession(creds)
-    return _session
-
-
-def _sheet_meta() -> tuple[str, str]:
-    """Google Sheets dosyasında yalnızca ListBot sekmesini seçer."""
-    if _sheet_cache:
-        return _sheet_cache["id"], _sheet_cache["title"]
-
-    s = _session_get()
-    sid = SHEET_ID
-    r = s.get(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}",
-        params={"fields": "sheets.properties(title)"},
-    )
-    r.raise_for_status()
-    for sheet in r.json().get("sheets", []):
-        title = sheet["properties"]["title"]
-        if title == SHEET_TAB_NAME:
-            _sheet_cache.update({"id": sid, "title": title})
-            return sid, title
-    raise RuntimeError(
-        f"'{SHEET_TAB_NAME}' sekmesi bulunamadı. "
-        "Sekme adının Google Sheets'te birebir aynı olduğundan emin olun."
-    )
-
-
-def _cell(value):
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
-CELL_RE = re.compile(r"^([A-Za-z]{1,2})([1-9][0-9]{0,3})$")
-MAX_COL = 702  # ZZ
-MAX_ROW = 5000
-
-
-def col_to_index(letters: str) -> int:
-    n = 0
-    for ch in letters.upper():
-        n = n * 26 + (ord(ch) - 64)
-    return n
-
-
-def index_to_col(n: int) -> str:
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def _values_url(rng: str) -> str:
-    sid, title = _sheet_meta()
-    return (
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/"
-        + quote(f"'{title}'!{rng}")
-    )
-
-
-def header_sync() -> list[str]:
-    r = _session_get().get(_values_url("A1:ZZ1"))
-    r.raise_for_status()
-    return (r.json().get("values") or [[]])[0]
-
-
-def read_cell_sync(cell: str) -> str:
-    r = _session_get().get(_values_url(cell))
-    r.raise_for_status()
-    values = r.json().get("values") or []
-    return str(values[0][0]) if values and values[0] else ""
-
-
-def _to_cell_value(value):
-    """Sayı gibi görünen metni sayıya çevirir; gerisini metin olarak bırakır (RAW)."""
-    if isinstance(value, (int, float)):
-        return value
-    text = str(value).strip()
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    if re.fullmatch(r"-?\d+[.,]\d+", text):
-        return float(text.replace(",", "."))
-    return text
-
-
-def write_cell_sync(cell: str, value) -> None:
-    r = _session_get().put(
-        _values_url(cell),
-        params={"valueInputOption": "RAW"},
-        json={"values": [[_to_cell_value(value)]]},
-    )
-    r.raise_for_status()
-
-
-# ListBot gerçek sütun düzeni (A:T). J:R hesaplama/formül alanlarıdır.
-LISTBOT_HEADERS = [
-    "Tarih", "No", "Yemek Türü", "Yemek Adı", "Stok",
-    "Gelen Adet", "Satılan Adet", "Fire", "Devreden",
-    "Birim Maliyet", "Fire Maliyeti", "Satış Fiyatı", "Ciro",
-    "Satış Maliyeti", "Brüt Kâr", "Üretim", "T_Maliyeti",
-    "Firesiz_Satış", "Eklenme Zamanı", "Notes",
-]
-INPUT_HEADERS = LISTBOT_HEADERS[:9]
-CALCULATED_HEADERS = LISTBOT_HEADERS[9:18]
-OUTPUT_HEADERS = LISTBOT_HEADERS[18:]
-
-
-def _values_read_sync(tab: str, rng: str) -> list[list]:
-    sid, _ = _sheet_meta()
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(f"'{tab}'!{rng}")}" 
-    r = _session_get().get(url)
-    r.raise_for_status()
-    return r.json().get("values") or []
-
-
-def _product_key(value: str) -> str:
-    # Yalnızca boşluk ve harf büyüklüğü farklarını yok say; belirsiz eşleşme yapma.
-    return " ".join(_norm(value).split())
-
-
-def _product_catalog_sync() -> dict:
-    data = _values_read_sync(SOURCE_TAB_NAME, "B5:C5000")
-    catalog = {}
-    for row in data:
-        if len(row) < 2 or not str(row[1]).strip():
-            continue
-        kind, name = str(row[0]).strip(), str(row[1]).strip()
-        key = _product_key(name)
-        # Aynı isim tekrar ediyorsa ilk görülen ürün kaydını koru.
-        # Böylece farklı türle tekrarlansa bile kayıt işlemi durmaz.
-        if key not in catalog:
-            catalog[key] = (kind, name)
-    if not catalog:
-        raise ValueError("Günlük Takip!C5:C ürün listesi boş veya okunamadı.")
-    return catalog
-
-
-def _find_product(requested: str, catalog: dict):
-    """Önce kesin, sonra kelime/kısmi ve yazım hatası eşleşmesi.
-
-    Belirsiz veya düşük güvenli ürünleri tahmin ederek kaydetmez.
-    """
-    key = _product_key(requested)
-    if not key:
-        return None
-    if key in catalog:
-        return catalog[key]
-
-    words = key.split()
-    ranked = []
-    for position, (candidate_key, value) in enumerate(catalog.items()):
-        candidate_words = candidate_key.split()
-        shared = set(words) & set(candidate_words)
-        similarity = SequenceMatcher(None, key, candidate_key).ratio()
-        # "Yağlama" -> "Kayseri Yağlama"; tek kelime tam token olmalı.
-        partial = (len(words) == 1 and words[0] in candidate_words and
-                   len(words[0]) >= 5)
-        # "Acılı Dana Güveç" -> "Acılı Güveç".
-        coverage = len(shared) / max(1, len(set(candidate_words)))
-        meaningful = (len(shared) >= 2 and coverage >= 0.70)
-        # "Otman Kebabı" -> "Orman Kebabı".
-        typo = similarity >= 0.80 and (bool(shared) or similarity >= 0.88)
-        if not (partial or meaningful or typo):
-            continue
-        score = (1.0 if partial else 0.0) + (0.85 if meaningful else 0.0) + similarity * 0.35
-        ranked.append((score, -position, value))
-    if not ranked:
-        return None
-    ranked.sort(reverse=True)
-    # İki farklı yemek aynı derecede uygun görünüyorsa kullanıcı düzeltsin.
-    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.035:
-        return None
-    logger.info("Ürün eşleştirildi: %s -> %s", requested, ranked[0][2][1])
-    return ranked[0][2]
-
-
-def _requested_name(row: dict) -> str:
-    for k, v in row.items():
-        if _norm(k) in ("yemek adi", "urun", "urun adi", "yemek"):
-            return str(v or "").strip()
-    return ""
-
-
-def _unmatched_rows_sync(rows: list[dict]) -> list[tuple[int, str, list[str]]]:
-    """Onaydan önce TÜM satırları kontrol eder; hiçbir şey yazmaz."""
-    catalog = _product_catalog_sync()
-    missing = []
-    for i, row in enumerate(rows, 1):
-        name = _requested_name(row)
-        if not _find_product(name, catalog):
-            from difflib import get_close_matches
-            keys = get_close_matches(_product_key(name), list(catalog), n=3, cutoff=0.38)
-            suggestions = [catalog[k][1] for k in keys]
-            missing.append((i, name or "(ürün adı boş)", suggestions))
-    return missing
-
-
-def _unmatched_message(missing) -> str:
-    lines = ["Şu ürünleri Günlük Takip C sütunuyla güvenle eşleştiremedim:"]
-    for i, name, suggestions in missing:
-        lines.append(f"{i}. satır: {name}")
-        if suggestions:
-            lines.append("   Olası isimler: " + ", ".join(suggestions))
-    lines.append("\nHiçbir satır eklenmedi. Düzeltmek için şu biçimde mesaj gönder:")
-    lines.append("düzelt: Yanlış Ürün = Kaynaktaki Doğru Ürün")
-    lines.append("Birden çok düzeltmeyi ayrı satırlara yazabilirsin. Sonra yeniden onay isteyeceğim.")
-    return "\n".join(lines)
-
-
-def _normalize_listbot_row(row: dict, catalog: dict, date: str, timestamp: str) -> dict:
-    # Sütun adlarını standartlaştır, tanınmayan alanları reddet.
-    aliases = { _norm(k): k for k in LISTBOT_HEADERS }
-    aliases.update({"urun": "Yemek Adı", "urun adi": "Yemek Adı", "yemek": "Yemek Adı", "miktar": "Gelen Adet", "not": "Notes", "notlar": "Notes", "aciklama": "Notes", "açıklama": "Notes", "note": "Notes"})
-    clean = {}
-    for k, v in row.items():
-        key = aliases.get(_norm(k))
-        if not key:
-            raise ValueError(f"Tanınmayan sütun: {k}")
-        if key in CALCULATED_HEADERS:
-            # Hesaplama alanları yalnızca Google Sheets formüllerine aittir.
-            continue
-        clean[key] = v
-    requested = str(clean.get("Yemek Adı") or "").strip()
-    match = _find_product(requested, catalog)
-    if not requested:
-        raise ValueError("Ürün adı boş; kaydedilemez.")
-    if match:
-        kind, canonical = match
-    else:
-        # Kaynakta eşleşmeyenleri silme/engelleme; elle düzeltme için -Y ile işaretle.
-        kind = str(clean.get("Yemek Türü") or "").strip()
-        canonical = requested if requested.upper().endswith("-Y") else requested + "-Y"
-        logger.warning("Ürün eşleşmedi, -Y ile kaydedilecek: %s", canonical)
-    clean["Yemek Türü"] = kind
-    clean["Yemek Adı"] = canonical
-    clean["Tarih"] = date
-    clean["Eklenme Zamanı"] = timestamp
-    clean.pop("No", None)  # ListBot'ta sıra numarası otomatik verilir
-    return clean
-
-
-def _check_listbot_headers(current: list[list]) -> None:
-    """Var olan A:I ve S:T başlıklarını denetler; J:R formüllerine dokunmaz."""
-    if not current or not current[0] or not any(str(x).strip() for x in current[0]):
-        raise ValueError(
-            "ListBot başlıkları bulunamadı. A:T başlıklarını Google Sheets'te oluşturun; "
-            "bot mevcut düzeni kendisi değiştirmeyecek."
-        )
-    header = [str(v).strip() for v in current[0]]
-    header += [""] * max(0, 20 - len(header))
-    for idx in list(range(9)) + [18, 19]:
-        if header[idx] != LISTBOT_HEADERS[idx]:
-            col = index_to_col(idx + 1)
-            raise ValueError(
-                f"ListBot {col}1 başlığı '{LISTBOT_HEADERS[idx]}' olmalı; "
-                f"şu an '{header[idx]}' görünüyor. Kayıt yapılmadı."
-            )
-
-
-def append_rows_sync(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
-    """A sütunundaki son kaydın altına yazar; mevcut diğer hücreleri korur.
-
-    P sütunundaki açılır menü değerleri veya J:R formülleri satır seçimini
-    etkilemez. Google Sheets values.append kullanılmaz: o yöntem P sütununu
-    da tablo sınırı sayıp yanlış satıra ekleyebilir.
-    """
-    if not rows:
-        raise ValueError("Eklenecek satır yok.")
-    s = _session_get()
-    sid, title = _sheet_meta()
-    now = datetime.now(TIMEZONE)
-    date = _date_from_text(date_override) if date_override else now.strftime("%d.%m.%Y")
-    timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
-    catalog = _product_catalog_sync()
-    prepared = [_normalize_listbot_row(row, catalog, date, timestamp) for row in rows]
-
-    # A sütunu esas alınır: P'deki "Dışarı" veya J:R formülleri
-    # yeni kayıt yerini değiştiremez.
-    current = _values_read_sync(title, "A1:T5000")
-    _check_listbot_headers(current)
-    last_a = 1
-    existing_numbers = []
-    for sheet_row, values in enumerate(current[1:], start=2):
-        if values and str(values[0]).strip():
-            last_a = sheet_row
-        if len(values) > 1 and str(values[1]).strip().isdigit():
-            existing_numbers.append(int(values[1]))
-    first = last_a + 1
-    last = first + len(prepared) - 1
-    if last > MAX_ROW:
-        raise ValueError(f"ListBot'ta {MAX_ROW}. satır sınırı aşılıyor; kayıt yapılmadı.")
-
-    # Hedef A:I ve S:T'de tek bir dolu hücre bile varsa üzerine yazma.
-    # J:R ise bilerek KONTROL EDİLMEZ ve DEĞİŞTİRİLMEZ;
-    # bu aralıkta mevcut formüller / P='Dışarı' korunur.
-    for sheet_row in range(first, last + 1):
-        existing = current[sheet_row - 1] if sheet_row <= len(current) else []
-        for col_index in list(range(0, 9)) + [18, 19]:
-            if col_index < len(existing) and str(existing[col_index]).strip():
-                cell = f"{index_to_col(col_index + 1)}{sheet_row}"
-                raise ValueError(
-                    f"{cell} hücresi zaten dolu. Var olan veri silinmesin diye "
-                    "hiçbir kayıt yapılmadı; tabloyu kontrol edin."
-                )
-
-    next_no = max(existing_numbers, default=0) + 1
-    for i, row in enumerate(prepared):
-        row["No"] = next_no + i
-    input_values = [[_cell(row.get(h, "")) for h in INPUT_HEADERS] for row in prepared]
-    output_values = [[_cell(row.get(h, "")) for h in OUTPUT_HEADERS] for row in prepared]
-
-    # İki aralığı tek Google Sheets values.batchUpdate isteğinde yaz.
-    # A:I ve S:T dışında hiçbir hücre güncellenmez; satır eklenmez/kaydırılmaz.
-    endpoint = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate"
-    body = {
-        "valueInputOption": "RAW",
-        "data": [
-            {"range": f"'{title}'!A{first}:I{last}", "values": input_values},
-            {"range": f"'{title}'!S{first}:T{last}", "values": output_values},
-        ],
-    }
-    try:
-        response = s.post(endpoint, json=body, timeout=60)
-        response.raise_for_status()
-    except Exception as exc:
-        # Ağ hatası olsa bile sunucu yazmış olabilir; otomatik tekrar yazma.
-        logger.exception("ListBot batchUpdate sonucu doğrulanamadı: satır %s-%s", first, last)
-        raise RuntimeError(
-            f"Kayıt sonucu doğrulanamadı (A{first}:I{last}, S{first}:T{last}). "
-            "Tekrar onaylamadan önce Google Sheets'i kontrol edin."
-        ) from exc
-
-    marked = [str(row["Yemek Adı"]) for row in prepared
-              if str(row["Yemek Adı"]).upper().endswith("-Y")]
-    logger.info("ListBot'a A sütununa göre %s-%s satırlarına %s kayıt yazıldı", first, last, len(prepared))
-    return len(prepared), marked
-
-
-TABLE_CONTEXT_CHARS = int(os.environ.get("TABLE_CONTEXT_CHARS", "6000"))
-_table_cache = {"t": 0.0, "text": ""}
-
-
-def read_table_sync() -> str:
-    """Tablonun içeriğini satır numaralarıyla, TAB ile ayrılmış metin olarak döndürür."""
-    s = _session_get()
-    sid, title = _sheet_meta()
-    rng = quote(f"'{title}'!A1:ZZ5000")
-    r = s.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{rng}")
-    r.raise_for_status()
-    values = r.json().get("values") or []
-    if not values:
-        return ""
-    header, rows = values[0], values[1:]
-    head_line = "Satır\t" + "\t".join(f"[{index_to_col(i)}] {h}" for i, h in enumerate(header, start=1))
-    numbered = [
-        f"{i}\t" + "\t".join(str(c) for c in row)
-        for i, row in enumerate(rows, start=2)
-    ]
-    # Yer sınırı için en yeni satırlardan geriye doğru, sığdığı kadarını al.
-    budget = TABLE_CONTEXT_CHARS - len(head_line)
-    secilen = []
-    for line in reversed(numbered):
-        if budget - len(line) - 1 < 0:
-            break
-        secilen.append(line)
-        budget -= len(line) + 1
-    secilen.reverse()
-    atlanan = len(numbered) - len(secilen)
-    out = "\n".join([head_line] + secilen)
-    if atlanan > 0:
-        out += (
-            f"\n(Not: Tabloda toplam {len(numbered)} veri satırı var; "
-            f"yer sınırı nedeniyle en eski {atlanan} satır gösterilmiyor.)"
-        )
-    return out
-
-
-async def table_context() -> str:
-    """Tablo içeriğini 20 saniyelik önbellekle okur."""
-    now = time.monotonic()
-    if _table_cache["t"] and now - _table_cache["t"] < 20:
-        return _table_cache["text"]
-    text = await asyncio.to_thread(read_table_sync)
-    _table_cache.update(t=now, text=text)
-    return text
-
-
-async def append_rows(rows: list[dict], date_override: str | None = None) -> tuple[int, list[str]]:
-    result = await asyncio.to_thread(append_rows_sync, rows, date_override)
-    _table_cache["t"] = 0.0  # yeni satırlar bir sonraki soruda görünsün
-    return result
-
-
-async def write_cell(cell: str, value) -> None:
-    await asyncio.to_thread(write_cell_sync, cell, value)
-    _table_cache["t"] = 0.0
-
-
-# --------------------------------------------------------- Telegram işleyicileri
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start komutu verildiğinde çalışır."""
-    if not await izinli_mi(update):
-        return
     await update.message.reply_text(
-        "Merhaba! Ben Momera Yemek Takip yapay zeka asistanınızım.\n"
-        "Bana yazabilir ya da bir fotoğraf gönderebilirsiniz. "
-        "Fotoğraftaki bilgileri okuyup onayınızla tabloya eklerim."
-    )
-
-
-async def dogrula(action: dict) -> tuple[dict | None, str]:
-    """İşlemi kurallar.md'deki izinlere göre denetler. (temiz_işlem, hata_mesajı) döndürür."""
-    if not PERMS["yazma"]:
-        return None, "Yazma işlemleri şu an kapalı (kurallar.md)."
-    tip = _norm(action.get("tip", "")).replace(" ", "_")
-    if tip not in PERMS["izinli_islemler"]:
-        return None, f"'{action.get('tip')}' işlemine izin verilmiyor (kurallar.md)."
-
-    if tip == "satir_ekle":
-        rows = [r for r in action.get("satirlar", []) if isinstance(r, dict) and r]
-        if not rows:
-            return None, "Eklenecek bir satır bulunamadı."
-        if len(rows) > PERMS["en_fazla_satir"]:
-            return None, f"Tek seferde en fazla {PERMS['en_fazla_satir']} satır eklenebilir."
-        izinsiz = set()
-        for row in rows:
-            for k in row:
-                kn = _norm(k)
-                if kn in PERMS["korumali_sutunlar"] or (
-                    PERMS["yazilabilir_sutunlar"] and kn not in PERMS["yazilabilir_sutunlar"]
-                ):
-                    izinsiz.add(str(k))
-        if izinsiz:
-            return None, "Şu sütunlara yazma izni yok: " + ", ".join(sorted(izinsiz))
-        selected_date = action.get("_tarih")
-        if selected_date:
-            try:
-                selected_date = _date_from_text(str(selected_date))
-            except ValueError as exc:
-                return None, str(exc)
-            if not selected_date:
-                return None, "Tarih DD.MM.YYYY biçiminde olmalı."
-        return {"tip": "satir_ekle", "satirlar": rows,
-                "_tarih": selected_date, "_tarih_kaynagi": action.get("_tarih_kaynagi", "otomatik"),
-                "_limit": action.get("_limit")}, ""
-
-    if tip == "hucre_yaz":
-        m = CELL_RE.match(str(action.get("hucre", "")).strip())
-        if not m:
-            return None, "Hücre adı geçersiz. Örnek: A2"
-        col, row = m.group(1).upper(), int(m.group(2))
-        if col_to_index(col) > MAX_COL or row > MAX_ROW:
-            return None, "Bu hücreye yazılamaz."
-        if row in PERMS["korumali_satirlar"]:
-            return None, f"{row}. satır korumalı, değiştirilemez (kurallar.md)."
-        if 10 <= col_to_index(col) <= 18:
-            return None, "J:R maliyet/hesaplama sütunları bot tarafından değiştirilemez."
-        deger = action.get("deger")
-        if isinstance(deger, (dict, list)) or deger is None or len(str(deger)) > 500:
-            return None, "Yazılacak değer geçersiz."
-        ihtiyac_var = bool(PERMS["korumali_sutunlar"] or PERMS["yazilabilir_sutunlar"])
-        header_adi = ""
-        try:
-            header = await asyncio.to_thread(header_sync)
-            idx = col_to_index(col)
-            header_adi = str(header[idx - 1]) if idx - 1 < len(header) else ""
-        except Exception:
-            logger.exception("Başlık satırı okunamadı")
-            if ihtiyac_var:
-                return None, "Tablo okunamadığı için sütun izni denetlenemedi; işlem yapılmadı."
-        kimlikler = {_norm(col)} | ({_norm(header_adi)} if header_adi else set())
-        if kimlikler & PERMS["korumali_sutunlar"]:
-            return None, f"{col} sütunu korumalı, değiştirilemez (kurallar.md)."
-        if PERMS["yazilabilir_sutunlar"] and not (kimlikler & PERMS["yazilabilir_sutunlar"]):
-            return None, f"{col} sütununa yazma izni yok (kurallar.md)."
-        try:
-            eski = await asyncio.to_thread(read_cell_sync, f"{col}{row}")
-        except Exception:
-            eski = ""
-        return {"tip": "hucre_yaz", "hucre": f"{col}{row}", "deger": deger, "eski": eski}, ""
-
-    return None, "Bu işlem desteklenmiyor."
-
-
-def _satir_onizleme(rows: list[dict]) -> str:
-    lines = []
-    for i, row in enumerate(rows, 1):
-        alanlar = "; ".join(f"{k}: {v}" for k, v in row.items() if v not in (None, ""))
-        lines.append(f"{i}. {alanlar or '(boş satır)'}")
-    return "\n".join(lines)
-
-
-def _onizleme(action: dict) -> str:
-    if action["tip"] == "satir_ekle":
-        chosen_date = action.get("_tarih") or datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-        return (f"ListBot'a {len(action['satirlar'])} satır eklenecek.\n"
-                f"Tarih (A sütunu): {chosen_date}\n"
-                "Porsiyon (F sütunu): Gelen Adet\nNotlar (T sütunu): Notes\n\n"
-                + _satir_onizleme(action["satirlar"]))
-    return (
-        f"{action['hucre']} hücresi değiştirilecek.\n"
-        f"Eski değer: {action.get('eski') or '(boş)'}\n"
-        f"Yeni değer: {action['deger']}"
-    )
-
-
-async def islem_calistir(msg, action: dict) -> bool:
-    """İşlemi yeniden denetleyip uygular. Tekrar denenebilecek bir hata olursa False döner."""
-    temiz, hata = await dogrula(action)
-    if temiz is None:
-        await msg.reply_text(hata)
-        return True
-    try:
-        if temiz["tip"] == "satir_ekle":
-            n, marked = await append_rows(temiz["satirlar"], temiz.get("_tarih"))
-            text = f"{n} satır ListBot tablosuna eklendi."
-            if marked:
-                text += "\nDüzeltmeniz gereken (-Y) ürünler: " + ", ".join(marked)
-        else:
-            await write_cell(temiz["hucre"], temiz["deger"])
-            text = f"{temiz['hucre']} hücresine '{temiz['deger']}' yazıldı."
-    except ValueError as exc:
-        await msg.reply_text(f"Kayıt yapılamadı: {exc}")
-        return True
-    except Exception as exc:
-        logger.exception("Tabloya yazılırken hata oluştu")
-        await msg.reply_text(
-            f"Tabloya yazarken hata oluştu: {exc}\n"
-            "Mükerrer kayıt oluşmaması için yeniden onaylamadan önce ListBot'u kontrol edin."
-        )
-        return True
-    await msg.reply_text(text)
-    return True
-
-
-async def islem_hazirla(msg, context: ContextTypes.DEFAULT_TYPE, action: dict):
-    """İşlemi denetler; izin varsa onay ister (ya da onay gerekmiyorsa doğrudan uygular)."""
-    temiz, hata = await dogrula(action)
-    if temiz is None:
-        await msg.reply_text(hata)
-        return
-    if temiz["tip"] == "satir_ekle":
-        try:
-            missing = await asyncio.to_thread(_unmatched_rows_sync, temiz["satirlar"])
-        except Exception:
-            logger.exception("Ürün listesi okunamadı")
-            await msg.reply_text("Günlük Takip ürün listesi okunamadı; yanlış kayıt oluşturmamak için işlem durduruldu.")
-            return
-        if missing:
-            context.user_data["isaretlenecek"] = [name for _, name, _ in missing]
-            names = ", ".join((name if name.upper().endswith("-Y") else name + "-Y") for _, name, _ in missing)
-            await msg.reply_text("Eşleşmeyen ürünler ListBot'a -Y ekiyle eklenecek: " + names[:3500])
-        else:
-            context.user_data.pop("isaretlenecek", None)
-        context.user_data.pop("duzeltilecek", None)
-    if not PERMS["onay"]:
-        await islem_calistir(msg, temiz)
-        return
-    context.user_data["bekleyen"] = temiz
-    buttons = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Evet, uygula", callback_data="onay"),
-            InlineKeyboardButton("Hayır", callback_data="iptal"),
-        ]]
-    )
-    await msg.reply_text(
-        (_onizleme(temiz) + "\n\nOnaylıyor musunuz?")[:TELEGRAM_MAX_LEN],
-        reply_markup=buttons,
+        "Merhaba! Ben Momera Yemek Takip yapay zeka asistanınızım. "
+        "Size nasıl yardımcı olabilirim?"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Yazılı mesajı Groq'a iletir; cevabı gösterir, gerekirse yazma işlemini hazırlar."""
-    if not await izinli_mi(update):
-        return
+    """Kullanıcıdan gelen mesajı seçili yapay zekaya iletir ve yanıtı döner."""
     user_text = update.message.text
-    # Fotoğraftan sonra "tarih 02 olsun" / "ilk 10 satır" denirse mevcut onayı güncelle.
-    pending = context.user_data.get("bekleyen")
-    if pending and pending.get("tip") == "satir_ekle" and _is_instruction_update(user_text):
-        try:
-            revised = _apply_user_constraints(pending, user_text,
-                                              pending.get("_tarih") or "")
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-            return
-        context.user_data.pop("bekleyen", None)
-        await islem_hazirla(update.message, context, revised)
-        return
-    history = context.user_data.setdefault("gecmis", [])
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
+
     try:
-        tablo = await table_context()
-        tablo_notu = (
-            "Tablonun güncel içeriği (TAB ile ayrılmış; ilk sütun tablodaki satır numarası, "
-            "sütun başlıklarındaki köşeli parantez sütun harfidir):\n" + tablo
-            if tablo
-            else "Tablo şu an boş."
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
         )
+        reply_text = response.choices[0].message.content or "Bir yanıt üretilemedi."
     except Exception:
-        logger.exception("Tablo okunamadı")
-        tablo_notu = (
-            "Tablo şu an okunamadı. Tablo verisi gerektiren sorularda bunu söyle, tahmin etme."
-        )
-    sistem = (
-        SYSTEM_PROMPT
-        + "\n\n"
-        + tablo_notu
-        + "\n\nTabloyla ilgili sorularda yalnızca bu veriye dayan; veride olmayan bir şeyi uydurma. "
-        "Toplam ya da ortalama gibi hesapları satırları tek tek toplayarak dikkatle yap. "
-        "Verinin sonunda 'gösterilmiyor' notu varsa, hesabın yalnızca gösterilen satırlara ait olduğunu açıkça belirt."
-        "\n\nYanıtını YALNIZCA geçerli bir JSON nesnesi olarak ver: "
-        '{"cevap": "kullanıcıya gösterilecek metin", "islem": null}. '
-        "Kullanıcı tabloya bir şey yazmak istediğinde islem alanını doldur: "
-        'yeni satır için {"tip": "satir_ekle", "satirlar": [{"Sütun adı": "değer"}]}; '
-        'tek bir hücreyi değiştirmek için {"tip": "hucre_yaz", "hucre": "A2", "deger": "değer"}. '
-        "Yalnızca kullanıcı açıkça isterse islem üret; soru sorulduğunda islem null olsun. "
-        "Silme gibi desteklenmeyen işlemlerde islem null olsun ve cevapta bunu yapamadığını söyle. "
-        "cevap alanına işlemi yaptığını yazma; ne yapılacağını kısaca özetle, onayı sistem ister. "
-        "Yeni satır eklerken Yemek Adı alanını mutlaka belirt. "
-        "Yemek Türü, No ve Eklenme Zamanı otomatik belirlenir. "
-        "Kullanıcı tarih verdiyse işlemde _tarih alanına DD.MM.YYYY olarak ekle; "
-        "kullanıcının tarihi fotoğraf veya bugünün tarihinden önceliklidir. "
-        "Porsiyon sayıları Gelen Adet sütununa yazılır. "
-        "Yemek yanında fazla geldi, eksik geldi gibi açıklamalar varsa aynı satırın Notes sütununa yaz. "
-        "Not yoksa Notes boş kalsın, notu yemek adına veya miktara ekleme. "
-        "ListBot sütunları: A Tarih, B No, C Yemek Türü, D Yemek Adı, E Stok, "
-        "F Gelen Adet, G Satılan Adet, H Fire, I Devreden, J:R hesaplama alanları, "
-        "S Eklenme Zamanı, T Notes. J:R alanlarına yazma. "
-        "Ürün adı Günlük Takip C sütunuyla eşleştirilir; eşleşmeyen ürünler ListBot'a -Y ekiyle kaydedilir. "
-        "Geçerli yazma izinleri: " + izin_ozeti() + "."
-    )
-    messages = (
-        [{"role": "system", "content": sistem}]
-        + history
-        + [{"role": "user", "content": user_text}]
-    )
-    try:
-        raw = await groq_chat(messages, GROQ_MODEL, json_mode=True)
-    except Exception:
-        logger.exception("Groq çağrısında hata oluştu")
+        logger.exception("Yapay zeka çağrısında hata oluştu (sağlayıcı: %s)", LLM_PROVIDER)
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
-    try:
-        data = parse_json(raw)
-        cevap = str(data.get("cevap") or "").strip()
-        islem = data.get("islem")
-    except Exception:
-        cevap, islem = raw.strip(), None
-    cevap = cevap or ("Bir yanıt üretilemedi." if not isinstance(islem, dict) else "")
-
-    history += [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": cevap or "(işlem hazırlandı)"},
-    ]
-    del history[:-HISTORY_LIMIT]
-
-    for part in split_text(cevap) if cevap else []:
+    for part in split_text(reply_text):
         await update.message.reply_text(part)
-    if isinstance(islem, dict) and islem:
-        try:
-            islem = _apply_user_constraints(islem, user_text)
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-            return
-        await islem_hazirla(update.message, context, islem)
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fotoğrafı Groq ile okutur, sonucu gösterip onay ister."""
-    if not await izinli_mi(update):
-        return
-    msg = update.message
-    if not PERMS["yazma"] or "satir_ekle" not in PERMS["izinli_islemler"]:
-        await msg.reply_text("Fotoğraftan tabloya ekleme şu an kapalı (kurallar.md).")
-        return
-    if msg.photo:
-        tg_file = await msg.photo[-1].get_file()
-        mime = "image/jpeg"
-    else:
-        tg_file = await msg.document.get_file()
-        mime = msg.document.mime_type or "image/jpeg"
-
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
-    )
-    data = bytes(await tg_file.download_as_bytearray())
-    if len(data) > MAX_IMAGE_BYTES:
-        await msg.reply_text(
-            "Fotoğraf çok büyük. Lütfen dosya olarak değil, normal fotoğraf olarak gönderin."
-        )
-        return
-
-    b64 = base64.b64encode(data).decode()
-    caption = msg.caption or "Fotoğraftaki bilgileri tabloya aktar."
-    messages = [
-        {"role": "system", "content": EXTRACT_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": caption},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-            ],
-        },
-    ]
-    try:
-        raw = await groq_chat(messages, GROQ_VISION_MODEL, json_mode=True)
-        result = parse_json(raw)
-        rows = [r for r in result.get("satirlar", []) if isinstance(r, dict) and r]
-    except Exception:
-        logger.exception("Fotoğraf okunurken hata oluştu")
-        await msg.reply_text(
-            "Fotoğrafı okuyamadım. Daha net ve yakından çekip tekrar gönderebilir misiniz?"
-        )
-        return
-
-    if not rows:
-        await msg.reply_text(
-            f"Tabloya eklenecek bir bilgi bulamadım. {result.get('ozet', '')}".strip()
-        )
-        return
-
-    if result.get("ozet"):
-        await msg.reply_text(str(result["ozet"])[:TELEGRAM_MAX_LEN])
-    requested_count = _first_rows_from_text(caption)
-    if requested_count is not None and len(rows) < requested_count:
-        await msg.reply_text(
-            f"Dikkat: İlk {requested_count} satırı istedin ama fotoğraftan yalnızca "
-            f"{len(rows)} yemek okunabildi. Eksik satırları uydurmuyorum."
-        )
-    try:
-        action = {"tip": "satir_ekle", "satirlar": rows}
-        photo_date = str(result.get("tarih") or "")
-        action = _apply_user_constraints(action, caption, photo_date)
-    except ValueError as exc:
-        await msg.reply_text(str(exc))
-        return
-    await islem_hazirla(msg, context, action)
-
-
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Onay düğmelerini işler."""
-    query = update.callback_query
-    if ALLOWED_USER_IDS and query.from_user.id not in ALLOWED_USER_IDS:
-        await query.answer("Yetkiniz yok.", show_alert=True)
-        return
-    await query.answer()
-    action = context.user_data.pop("bekleyen", None)
-    if query.data == "iptal" or not action:
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            "Tamam, yapmadım." if query.data == "iptal" else "Bekleyen işlem yok."
-        )
-        return
-    await query.edit_message_reply_markup(reply_markup=None)
-    if not await islem_calistir(query.message, action):
-        context.user_data["bekleyen"] = action  # tekrar denenebilsin
 
 
 def main():
-    missing = [
-        n for n in ("TELEGRAM_BOT_TOKEN", "GROQ_API_KEY", "GOOGLE_CREDENTIALS_JSON")
-        if not os.environ.get(n)
-    ]
-    if missing:
-        logger.warning("Eksik ortam değişkenleri: %s", ", ".join(missing))
-    logger.info("Groq modeli: %s | Resim modeli: %s", GROQ_MODEL, GROQ_VISION_MODEL)
-    logger.info("Yazma izinleri: %s", izin_ozeti())
-
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_button, pattern="^(onay|iptal)$"))
 
     if RENDER_EXTERNAL_URL:
         # Render (Web Service): webhook modu, Render'ın verdiği PORT'u dinler
