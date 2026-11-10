@@ -42,7 +42,9 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 
 ## Kayıt öncesi onay (zorunlu)
 1. **Önizleme:** Google Drive'da hiçbir işlem yapmadan önce eklenecek tabloyu mesaj olarak göster.
-   - Kolonlar: ID, Tarih, Yemek Adı, Adet, NOTE.
+   - Tablonun başında listenin **LISTBOT tablosuna kaydedileceğini** ve **kayıt tarihini** açıkça yaz.
+   - Kayıt tarihi: kullanıcı başka bir tarih söylemedikçe veya düzeltmedikçe **bugünün tarihi**dir. Tarih de ID gibi düzeltilebilir (örn. "tarih 09.11.2026 olsun").
+   - Kolonlar: ID, Yemek Adı, Adet, NOTE (tarih tablonun başında bir kez yazılır).
    - Her satıra 2 basamaklı geçici bir ID ver: 01, 02, 03… şeklinde sırayla.
    - Bu ID yalnızca düzeltme için kullanılır; LISTBOT'a kaydedilmez.
 2. **Düzeltme:** Tablonun altında kullanıcıya düzeltme isteği olup olmadığını sor.
@@ -51,8 +53,8 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
    - Listede olmayan bir ID verilirse uygulama, kullanıcıya bildir.
    - Düzeltilen satırların NOTE kolonuna "kullanıcı düzeltti" ekle.
 3. **Tekrar onay:** Her düzeltmeden sonra güncel tablonun tamamını tekrar göster ve yeniden onay iste. Satır silinse bile ID'leri değiştirme.
-4. **Kayıt:** Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki LISTBOT sekmesine kaydet.
-5. **Bildirim:** Kayıttan sonra kaç satırın hangi tarihe eklendiğini kısaca bildir.
+4. **Kayıt:** "onay" mesajını sistem (kod) yakalar ve kaydı kendisi yapar. Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki LISTBOT sekmesine kaydet.
+5. **Bildirim:** Kayıt sonrası bildirimi sistem gönderir: kaç satırın hangi tarihle LISTBOT'a eklendiği.
 6. **Dürüstlük:** Kaydı sen yapmazsın; kayıt sistem tarafından yapılır. Sistem kaydın başarılı olduğunu bildirmedikçe asla "kaydedildi", "işlendi", "yüklendi" deme.
 
 ## Eklenecek kurallar
