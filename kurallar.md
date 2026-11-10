@@ -41,12 +41,18 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 4. **Tarih:** Kayıt tarihi, mesajın geldiği tarihtir. Kullanıcı mesajda farklı bir tarih belirtirse o tarihi kullan.
 
 ## Kayıt öncesi onay (zorunlu)
-1. Google Drive'da hiçbir işlem yapmadan önce eklenecek tabloyu mesaj olarak göster.
-2. Tablonun her satırına sıra numarası (ID) ver. Kolonlar: ID, Tarih, Yemek Adı, Adet, NOTE.
-3. Kullanıcıya düzeltme isteği olup olmadığını sor; düzeltmeleri ID'ye göre al (örn. "3 numaranın adedi 12 olsun").
-4. Her düzeltmeden sonra güncel tabloyu tekrar göster.
-5. Kullanıcı açıkça onay verdikten sonra ("onay", "kaydet" vb.) satırları Google Drive'daki LISTBOT sekmesine kaydet. Onay gelmeden kayıt yapma (bu adım kodda da zorunludur).
-6. Kayıt sonrası kaç satırın hangi tarihe eklendiğini kısaca bildir.
+1. **Önizleme:** Google Drive'da hiçbir işlem yapmadan önce eklenecek tabloyu mesaj olarak göster.
+   - Kolonlar: ID, Tarih, Yemek Adı, Adet, NOTE.
+   - Her satıra 2 basamaklı geçici bir ID ver: 01, 02, 03… şeklinde sırayla.
+   - Bu ID yalnızca düzeltme için kullanılır; LISTBOT'a kaydedilmez.
+2. **Düzeltme:** Tablonun altında kullanıcıya düzeltme isteği olup olmadığını sor.
+   - Düzeltmeleri ID'ye göre al. Örnekler: "05 numaralı yemeğin adedi 11 olsun", "07'nin adı Tavuk Sote olsun", "12'yi sil".
+   - Tek mesajda birden fazla düzeltme gelebilir; hepsini uygula.
+   - Listede olmayan bir ID verilirse uygulama, kullanıcıya bildir.
+   - Düzeltilen satırların NOTE kolonuna "kullanıcı düzeltti" ekle.
+3. **Tekrar onay:** Her düzeltmeden sonra güncel tablonun tamamını tekrar göster ve yeniden onay iste. Satır silinse bile ID'leri değiştirme.
+4. **Kayıt:** Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki LISTBOT sekmesine kaydet.
+5. **Bildirim:** Kayıttan sonra kaç satırın hangi tarihe eklendiğini kısaca bildir.
 
 ## Eklenecek kurallar
 - (Buraya yeni kurallarınızı madde madde yazın.)
