@@ -23,22 +23,46 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Genel ayarlar (Render > Environment sekmesinden gelir, koda yazılmaz) ---
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
-PORT = int(os.environ.get("PORT", "10000"))
-# Render bu değişkeni otomatik verir (ör. https://momera-yemektakip-ai-bot.onrender.com)
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+# ============================================================
+# AYARLAR — model ve davranış ayarları burada, kodun içinde.
+# Render > Environment'ta yalnızca gizli anahtarlar durur:
+#   TELEGRAM_BOT_TOKEN, EVREN_API_KEY  (WEBHOOK_SECRET opsiyonel)
+# ============================================================
+
+# EVREN LLM API adresi
+EVREN_BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
+
+# Metin mesajları (düzeltme, onay, sorular) için model
+TEXT_MODEL = "deepseek-v4.1-flash"
+
+# Resim okuma modelleri — sırayla denenir. İlki hata verirse (dolu, kapalı vb.)
+# bir sonrakine geçilir. Test sonucuna göre sıralamayı değiştirebilirsiniz.
+VISION_MODELS = [
+    "gemma-4-31b",          # el yazısı çözümleme, belge okuma
+    "qwen3-vl-30b",         # tablo / belge görsel akıl yürütme
+    "deepseek-v4.1-flash",  # yedek
+]
+
+# Düşünen modellerde düşünme + yanıt aynı bütçeyi kullanır; EVREN en az 2048 önerir
+MAX_TOKENS = 4096
+
+# Sohbet geçmişinde tutulacak en fazla mesaj sayısı (kullanıcı + bot)
+MAX_HISTORY = 20
+
+# Kural dosyası (GitHub'da kodla aynı klasörde)
+PROMPT_FILE = "prompt.md"
 
 TELEGRAM_MAX_LEN = 4096
-# Düşünen modellerde (DeepSeek, Qwen) düşünme + yanıt aynı bütçeyi kullanır; EVREN en az 2048 önerir
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
-# Sohbet geçmişinde tutulacak en fazla mesaj sayısı (kullanıcı + bot)
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
-# --- Kural dosyası (prompt.md) ---
-# Kurallar artık koddan değil, GitHub'daki prompt.md dosyasından okunur.
-PROMPT_FILE = os.environ.get("PROMPT_FILE", "prompt.md")
+# --- Gizli anahtarlar (Render > Environment) ---
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+EVREN_API_KEY = os.environ["EVREN_API_KEY"]
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
+
+# --- Render'ın kendisinin otomatik verdiği değerler (elle girilmez) ---
+PORT = int(os.environ.get("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+
 DEFAULT_PROMPT = (
     "Sen Momera Yemek Takip yapay zeka asistanısın. "
     "Kullanıcılara Türkçe, kısa ve anlaşılır yanıtlar ver."
@@ -58,44 +82,13 @@ def load_system_prompt() -> str:
 
 SYSTEM_PROMPT = load_system_prompt()
 
-# --- Yapay zeka sağlayıcısı seçimi ---
-# Render'da LLM_PROVIDER = evren  ya da  grok  yazarak seçersin (varsayılan: evren).
-# İkisi de OpenAI uyumlu olduğu için aynı kütüphane ile çalışır.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "evren").strip().lower()
-
-
-def build_client() -> tuple[AsyncOpenAI, str, str]:
-    """Seçilen sağlayıcıya göre istemciyi, metin modelini ve resim modelini döndürür."""
-    if LLM_PROVIDER == "evren":
-        api_key = os.environ["EVREN_API_KEY"]
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=os.environ.get("EVREN_BASE_URL", "https://evren-llmapi.ssyz.org.tr/v1"),
-            # EVREN anahtarı X-API-Key başlığıyla beklenir
-            default_headers={"X-API-Key": api_key},
-        )
-        model = os.environ.get("EVREN_MODEL", "auto")
-        # Resim okuyabilen model ("auto" yalnızca metin destekler)
-        vision_model = os.environ.get("EVREN_VISION_MODEL", "deepseek-v4.1-flash")
-    elif LLM_PROVIDER == "grok":
-        client = AsyncOpenAI(
-            api_key=os.environ["GROK_API_KEY"],
-            base_url=os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1"),
-        )
-        model = os.environ.get("GROK_MODEL", "grok-4")
-        vision_model = os.environ.get("GROK_VISION_MODEL", model)
-    else:
-        raise RuntimeError(
-            f"Geçersiz LLM_PROVIDER: {LLM_PROVIDER!r}. 'evren' ya da 'grok' olmalı."
-        )
-    return client, model, vision_model
-
-
-client, MODEL, VISION_MODEL = build_client()
-logger.info(
-    "Yapay zeka sağlayıcısı: %s, model: %s, resim modeli: %s",
-    LLM_PROVIDER, MODEL, VISION_MODEL,
+client = AsyncOpenAI(
+    api_key=EVREN_API_KEY,
+    base_url=EVREN_BASE_URL,
+    # EVREN anahtarı X-API-Key başlığıyla beklenir
+    default_headers={"X-API-Key": EVREN_API_KEY},
 )
+logger.info("EVREN — metin modeli: %s, resim modelleri: %s", TEXT_MODEL, VISION_MODELS)
 
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -140,6 +133,20 @@ async def ask_llm(model: str, history: list[dict], user_content) -> str:
     return response.choices[0].message.content or "Bir yanıt üretilemedi."
 
 
+async def ask_vision(history: list[dict], user_content) -> str:
+    """Resim modellerini sırayla dener; ilk başarılı yanıtı döndürür."""
+    last_error = None
+    for model in VISION_MODELS:
+        try:
+            reply = await ask_llm(model, history, user_content)
+            logger.info("Resim okundu (model: %s)", model)
+            return reply
+        except Exception as e:
+            logger.warning("Resim modeli başarısız (%s): %s — sıradakine geçiliyor", model, e)
+            last_error = e
+    raise last_error
+
+
 async def send_reply(update: Update, text: str):
     for part in split_text(text):
         await update.message.reply_text(part)
@@ -178,9 +185,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        reply_text = await ask_llm(MODEL, get_history(context), user_text)
+        reply_text = await ask_llm(TEXT_MODEL, get_history(context), user_text)
     except Exception:
-        logger.exception("Yapay zeka çağrısında hata oluştu (sağlayıcı: %s)", LLM_PROVIDER)
+        logger.exception("Yapay zeka çağrısında hata oluştu (model: %s)", TEXT_MODEL)
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
@@ -224,9 +231,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
-        reply_text = await ask_llm(VISION_MODEL, get_history(context), user_content)
+        reply_text = await ask_vision(get_history(context), user_content)
     except Exception:
-        logger.exception("Resim okuma çağrısında hata oluştu (model: %s)", VISION_MODEL)
+        logger.exception("Hiçbir resim modeli yanıt veremedi: %s", VISION_MODELS)
         await msg.reply_text(
             "Üzgünüm, resmi işlerken bir hata oluştu. Lütfen tekrar deneyin."
         )
