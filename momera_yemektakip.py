@@ -324,6 +324,7 @@ def parse_table(text: str):
 
 # --- Google Sheets ---
 HEADER_ALIASES = {
+    "no": "no", "no.": "no", "numara": "no",
     "tarih": "date", "date": "date",
     "yemek adı": "name", "yemek adi": "name", "yemek": "name",
     "adet": "qty", "sayı": "qty", "sayi": "qty", "miktar": "qty",
@@ -350,12 +351,17 @@ def append_to_listbot(date: str, rows: list[dict]) -> int:
     ws = sheets_client().open_by_key(SPREADSHEET_ID).worksheet(LISTBOT_SHEET)
     header = ws.row_values(1)
     if not header:
-        header = ["Tarih", "Yemek Adı", "Adet", "NOTE"]
+        header = ["NO", "Tarih", "Yemek Adı", "Adet", "NOTE"]
         ws.append_row(header)
     keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
     values = []
+    d, m, y = date.split(".")
+    prefix = f"{y[-2:]}{m.zfill(2)}{d.zfill(2)}"  # yymmdd, örn. 10.11.2026 -> 261110
     for r in rows:
-        data = {"date": date, "name": r["name"], "qty": r["qty"], "note": r["note"]}
+        data = {
+            "no": f"{prefix}-{r['id']}",  # örn. 261110-05
+            "date": date, "name": r["name"], "qty": r["qty"], "note": r["note"],
+        }
         values.append([data.get(k, "") if k else "" for k in keys])
     ws.append_rows(values, value_input_option="USER_ENTERED")
     return len(values)
