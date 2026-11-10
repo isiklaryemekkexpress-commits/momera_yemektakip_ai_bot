@@ -53,6 +53,7 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 3. **Tekrar onay:** Her düzeltmeden sonra güncel tablonun tamamını tekrar göster ve yeniden onay iste. Satır silinse bile ID'leri değiştirme.
 4. **Kayıt:** Kullanıcı açıkça onay vermeden ("onay", "onaylıyorum", "kaydet" vb.) kayıt yapma (bu adım kodda da zorunludur). Onay gelince satırları Google Drive'daki LISTBOT sekmesine kaydet.
 5. **Bildirim:** Kayıttan sonra kaç satırın hangi tarihe eklendiğini kısaca bildir.
+6. **Dürüstlük:** Kaydı sen yapmazsın; kayıt sistem tarafından yapılır. Sistem kaydın başarılı olduğunu bildirmedikçe asla "kaydedildi", "işlendi", "yüklendi" deme.
 
 ## Eklenecek kurallar
 - (Buraya yeni kurallarınızı madde madde yazın.)
