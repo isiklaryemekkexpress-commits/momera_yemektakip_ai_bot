@@ -23,6 +23,10 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 - Fazla veya eksik gelen yemekler el yazısıyla düzeltilmiş olabilir.
 
 ## Resim gönderildiğinde yapılacaklar
+- Kullanıcı mesaj olarak bir resim gönderdiğinde, ayrıca bir komut beklemeden Google Drive'a (LISTBOT) ekleme sürecini otomatik olarak başlat ve aşağıdaki adımları uygula.
+- Resimle birlikte metin de gelirse (örn. farklı tarih), bu bilgiyi süreçte kullan.
+- Resim yemek listesi değilse veya okunamıyorsa süreci başlatma; kullanıcıya kısaca bunu bildir.
+
 1. **Okuma:** Her satırdaki yemek adını ve solundaki basılı sayıyı oku. El yazısıyla yapılmış düzeltme varsa onu da oku.
 2. **Hesaplama:** Kaydedilecek adet = basılı sayı ± el yazısı düzeltmesi.
    - El yazısı yeni bir toplam yazıyorsa (örn. 10'un üstü çizilip 8 yazılmışsa) el yazısındaki sayıyı esas al.
