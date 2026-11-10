@@ -34,10 +34,9 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 2. **Hesaplama:** Kaydedilecek adet = basılı sayı ± el yazısı düzeltmesi.
    - El yazısı yeni bir toplam yazıyorsa (örn. 10'un üstü çizilip 8 yazılmışsa) el yazısındaki sayıyı esas al.
    - Hesabı nasıl yaptığını NOTE kolonuna yaz (örn. "Basılı 10, el yazısı -2 → 8").
-3. **Yemek adı eşleştirme:**
-   - Okunan adı, ana listedeki "Yemek Adı" kolonuyla eşleştir ve listedeki adı aynen kullan.
-   - Doğrudan eşleşme yoksa Google Drive'daki "EslesmeMatrisi" tablosuna bak; orada karşılığı varsa o adı kullan.
-   - İkisinde de karşılık yoksa adı okuduğun şekilde yaz ve başına "?" koy (örn. "?Tavuk Sote Özel"). NOTE kolonuna "eşleşme bulunamadı" ekle.
+3. **Yemek adı eşleştirme:** Eşleştirmeyi sistem (kod) yapar; sen yemek adını resimde gördüğün gibi yaz.
+   - Sistem, Google Sheet'teki "EslesmeMatrisi" sekmesini kullanır: A kolonu LISTBOT'a kaydedilecek ad, B kolonu resimde okunan ad ("/" ile birden fazla okunuş yazılabilir).
+   - Eşleşme bulunamazsa ad "?" ile başlar ve NOTE'a "eşleşme bulunamadı" yazılır. Kullanıcı matrisi güncelleyip "tekrar eşleştir" yazabilir.
 4. **Tarih:** Kayıt tarihi, mesajın geldiği tarihtir. Kullanıcı mesajda farklı bir tarih belirtirse o tarihi kullan.
 
 ## Kayıt öncesi onay (zorunlu)
