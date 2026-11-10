@@ -64,8 +64,8 @@ VISION_CHAIN = [
 # --- Google Sheets ---
 # Tablonun adresindeki ID: docs.google.com/spreadsheets/d/<BURASI>/edit
 SPREADSHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
-LISTBOT_SHEET = "LISTBOT"
-MATRIX_SHEET = "EslesmeMatrisi"  # A: LISTBOT'a kaydedilecek ad, B: resimde okunan ad
+LISTBOT_SHEET = "ListBot"
+MATRIX_SHEET = "EslesmeMatrisi"  # A: ListBot'a kaydedilecek ad, B: resimde okunan ad
 FUZZY_THRESHOLD = 0.85  # yaklaşık eşleşme için benzerlik eşiği (0-1)
 TIMEZONE = ZoneInfo("Europe/Istanbul")
 
@@ -263,7 +263,7 @@ def message_header(update: Update) -> str:
 # bu yüzden yapay zeka her tabloyu tam olarak böyle göstermelidir.
 TABLE_FORMAT = """Tabloyu tam olarak şu biçimde göster (her satır ayrı, sütunlar " | " ile ayrılmış):
 
-📋 LISTBOT tablosuna kaydedilecek liste
+📋 ListBot tablosuna kaydedilecek liste
 📅 Kayıt tarihi: GG.AA.YYYY
 
 ID | Yemek Adı | Adet | NOTE
@@ -271,7 +271,7 @@ ID | Yemek Adı | Adet | NOTE
 02 | ...
 
 Toplam: <satır sayısı> satır
-Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05'in adedi 11 olsun", "tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste LISTBOT tablosuna yukarıdaki tarihle kaydedilecek.
+Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05'in adedi 11 olsun", "tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste ListBot tablosuna yukarıdaki tarihle kaydedilecek.
 
 Kayıt tarihi kuralı: Kullanıcı başka bir tarih söylemedikçe veya düzeltmedikçe bugünün tarihini kullan."""
 
@@ -284,7 +284,7 @@ PHOTO_INSTRUCTION = """Kullanıcı yemek listesi resmi gönderdi. Kurallardaki '
 
 RESMİ OKUMA KURALLARI:
 - Form yukarıdan aşağıya numaralı satırlardan oluşur (1, 2, 3 … 45 gibi). Formun TAMAMINI en üst satırdan en alt satıra kadar oku; sadece bir bölümünü değil.
-- ID olarak satırın solundaki basılı satır numarasını kullan (örn. 01, 02, 17, 34).
+- ID sütununa 01'den başlayarak sırayla numara ver (01, 02, 03 …); formdaki basılı satır numarasını kullanma.
 - Basılı satır numarasının sağında sayı (adet), onun sağında yemek adı bulunur.
 - Yemek adı ve adedi boş olan satırları ATLA, tabloya yazma.
 - Sol kenardaki dikey yazılar (örn. "ETLİ YEMEKLER", "ÇORBA", "TATLI-MEZE", "PİLAV-MAKARNA") bölüm başlığıdır, yemek DEĞİLDİR; tabloya yazma.
@@ -300,7 +300,7 @@ EDIT_INSTRUCTION = """[Sistem notu: Onay bekleyen bir liste var. Kullanıcı dü
 """ + TABLE_FORMAT
 
 
-SAVED_EDIT_INSTRUCTION = """[Sistem görevi] Kullanıcının son mesajı, LISTBOT tablosuna DAHA ÖNCE KAYDEDİLMİŞ satırlarda değişiklik isteği mi?
+SAVED_EDIT_INSTRUCTION = """[Sistem görevi] Kullanıcının son mesajı, ListBot tablosuna DAHA ÖNCE KAYDEDİLMİŞ satırlarda değişiklik isteği mi?
 Kayıtlı satırların NO değeri "{prefix}-ID" biçimindedir (ID 2 basamaklı, örn. 17 -> {prefix}-17). Kullanıcı tam NO yazarsa (örn. 261109-05) onu kullan.
 Değiştirilebilir alanlar: "adet", "yemek adı", "note", "tarih". Silme için "action": "sil".
 
@@ -338,10 +338,10 @@ async def try_saved_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         async with keep_alive(update, context):
             results = await asyncio.to_thread(update_listbot, edits)
     except Exception as e:
-        logger.exception("LISTBOT güncellemesi başarısız")
+        logger.exception("ListBot güncellemesi başarısız")
         await update.message.reply_text(f"❌ Tablo güncellenemedi, değişiklik yapılmadı.\nHata: {e}")
         return True
-    msg = "LISTBOT tablosu güncellendi:\n" + "\n".join(results)
+    msg = "ListBot tablosu güncellendi:\n" + "\n".join(results)
     add_to_history(context, "user", text)
     add_to_history(context, "assistant", f"[Sistem] {msg}")
     await send_reply(update, msg)
@@ -411,7 +411,7 @@ def open_tab(name: str):
     if not SPREADSHEET_ID:
         raise RuntimeError("Kodda SPREADSHEET_ID boş.")
     sh = sheets_client().open_by_key(SPREADSHEET_ID)
-    # Sekme adı büyük/küçük harf ve boşluk farkı gözetmeden bulunur (ListBot = LISTBOT)
+    # Sekme adı büyük/küçük harf ve boşluk farkı gözetmeden bulunur (ListBot = LISTBOT = listbot)
     target = name.replace(" ", "").lower()
     for ws in sh.worksheets():
         if ws.title.replace(" ", "").lower() == target:
@@ -496,7 +496,7 @@ def update_listbot(edits: list[dict]) -> list[str]:
     header = ws.row_values(1)
     keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
     if "no" not in keys:
-        raise RuntimeError("LISTBOT'ta NO kolonu bulunamadı.")
+        raise RuntimeError("ListBot'ta NO kolonu bulunamadı.")
     no_col = keys.index("no") + 1
     results, deletes = [], []
     no_values = ws.col_values(no_col)
@@ -505,7 +505,7 @@ def update_listbot(edits: list[dict]) -> list[str]:
         try:
             row = no_values.index(no) + 1
         except ValueError:
-            results.append(f"⚠️ {no}: LISTBOT'ta bulunamadı, değişiklik yapılmadı.")
+            results.append(f"⚠️ {no}: ListBot'ta bulunamadı, değişiklik yapılmadı.")
             continue
         if e.get("action") == "sil":
             deletes.append((row, no))
@@ -527,7 +527,7 @@ def update_listbot(edits: list[dict]) -> list[str]:
 
 
 def append_to_listbot(date: str, rows: list[dict]) -> int:
-    """Satırları LISTBOT sekmesine ekler. Sütunları başlık satırına göre eşleştirir."""
+    """Satırları ListBot sekmesine ekler. Sütunları başlık satırına göre eşleştirir."""
     ws = open_listbot()
     header = ws.row_values(1)
     if not header:
@@ -564,14 +564,14 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 TABLE_FOOTER = (
     'Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05\'in adedi 11 olsun", '
-    '"tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste LISTBOT tablosuna '
+    '"tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste ListBot tablosuna '
     "yukarıdaki tarihle kaydedilecek."
 )
 
 
 def render_table(date: str, rows: list[dict], warning: str = "") -> str:
     lines = [
-        "📋 LISTBOT tablosuna kaydedilecek liste",
+        "📋 ListBot tablosuna kaydedilecek liste",
         f"📅 Kayıt tarihi: {date}",
         "",
         "ID | Yemek Adı | Adet | NOTE",
@@ -606,13 +606,19 @@ def apply_matching(rows: list[dict]) -> str:
     return ""
 
 
-async def process_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str) -> str:
+async def process_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str,
+                        renumber: bool = False) -> str:
     """Yanıtta tablo varsa: adları eşleştirir, bekleyen liste olarak saklar ve
     kullanıcıya gösterilecek standart tabloyu döndürür. Tablo yoksa metni aynen döndürür."""
     parsed = parse_table(reply_text)
     if not parsed:
         return reply_text
     date, rows = parsed
+    if renumber:
+        # Yeni listede ID'ler her zaman 01, 02, 03 … şeklinde sıralı verilir.
+        # Düzeltmelerde ise ID'ler değişmez (kullanıcının elindeki numaralar kaymasın).
+        for i, r in enumerate(rows, 1):
+            r["id"] = f"{i:02d}"
     warning = await asyncio.to_thread(apply_matching, rows)
     context.chat_data["pending"] = (date, rows)
     return render_table(date, rows, warning)
@@ -628,22 +634,23 @@ async def save_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     date, rows = pending
     await update.message.reply_text(
-        f"Onay alındı. {len(rows)} satır {date} tarihiyle LISTBOT tablosuna kaydediliyor..."
+        f"Onay alındı. {len(rows)} satır {date} tarihiyle ListBot tablosuna kaydediliyor..."
     )
     try:
         count = await asyncio.to_thread(append_to_listbot, date, rows)
     except Exception as e:
-        logger.exception("LISTBOT kaydı başarısız")
+        logger.exception("ListBot kaydı başarısız")
         await update.message.reply_text(
-            f"❌ Kayıt yapılamadı, LISTBOT tablosuna hiçbir şey eklenmedi.\nHata: {e}\n"
+            f"❌ Kayıt yapılamadı, ListBot tablosuna hiçbir şey eklenmedi.\nHata: {e}\n"
             "Liste hâlâ onay bekliyor; sorun giderilince tekrar \"onay\" yazabilirsiniz."
         )
         return
     context.chat_data.pop("pending", None)
     context.chat_data["saved_prefix"] = date_prefix(date)
     msg = (
-        f"✅ Kayıt tamamlandı: {count} satır {date} tarihiyle LISTBOT tablosuna eklendi.\n"
-        f"Satırlar NO kolonunda {date_prefix(date)}-ID olarak kayıtlı. Düzeltme gerekirse "
+        f"✅ Kayıt tamamlandı: {count} satır {date} tarihiyle ListBot tablosuna eklendi.\n"
+        f"NO kolonunda {date_prefix(date)}-{rows[0]['id']} … {date_prefix(date)}-{rows[-1]['id']} "
+        "olarak kayıtlı. Düzeltme gerekirse "
         "yazmanız yeterli (örn. \"17'nin adedi 12 olsun\"), doğrudan tabloda güncellerim."
     )
     add_to_history(context, "assistant", f"[Sistem] {msg}")
@@ -736,7 +743,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             step = "yemek adları eşleştirilirken"
             context.chat_data.pop("pending", None)  # yeni resim önceki listeyi değiştirir
-            reply_text = await process_table(context, reply_text)
+            reply_text = await process_table(context, reply_text, renumber=True)
     except Exception as e:
         logger.exception("Resim işlenemedi (%s)", step)
         await msg.reply_text(
