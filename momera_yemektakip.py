@@ -1,4 +1,6 @@
+import asyncio
 import base64
+from contextlib import asynccontextmanager
 import logging
 import os
 from pathlib import Path
@@ -27,13 +29,23 @@ logger = logging.getLogger(__name__)
 # AYARLAR — model ve davranış ayarları burada, kodun içinde.
 # Render > Environment'ta yalnızca gizli anahtarlar durur:
 #   TELEGRAM_BOT_TOKEN ve seçili sağlayıcının anahtarı
-#   (grok -> GROK_API_KEY, evren -> EVREN_API_KEY), WEBHOOK_SECRET opsiyonel
+#   (groq -> GROQ_API_KEY, grok -> GROK_API_KEY, evren -> EVREN_API_KEY)
+#   WEBHOOK_SECRET opsiyonel
 # ============================================================
 
-# Kullanılacak sağlayıcı: "grok" ya da "evren"
-PROVIDER = "grok"
+# Kullanılacak sağlayıcı: "groq", "grok" ya da "evren"
+# DİKKAT: Groq (groq.com, anahtar "gsk_" ile başlar) ile
+#         Grok (xAI, anahtar "xai-" ile başlar) farklı şirketlerdir.
+PROVIDER = "groq"
 
 PROVIDERS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_env": "GROQ_API_KEY",
+        "text_model": "qwen/qwen3.8-27b",
+        # Groq'ta resim okuyabilen model (önizleme; kaldırılırsa burayı güncelleyin)
+        "vision_models": ["qwen/qwen3.8-27b"],
+    },
     "grok": {
         "base_url": "https://api.x.ai/v1",
         "key_env": "GROK_API_KEY",
@@ -65,9 +77,18 @@ PROMPT_FILE = "prompt.md"
 
 TELEGRAM_MAX_LEN = 4096
 
+# Yapay zeka bu süre içinde cevap vermezse "devam ediyorum" mesajı atılır (saniye)
+PROGRESS_INTERVAL = 30
+PROGRESS_TEXT = "Çalışmaya devam ediyorum, lütfen bekleyin..."
+
 # --- Gizli anahtarlar (Render > Environment) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-API_KEY = os.environ[CFG["key_env"]]
+API_KEY = os.environ.get(CFG["key_env"])
+if not API_KEY:
+    raise RuntimeError(
+        f"Render > Environment'ta {CFG['key_env']} bulunamadı "
+        f"(PROVIDER = {PROVIDER!r}). Değişkeni ekleyin ya da PROVIDER'ı değiştirin."
+    )
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
 
 # --- Render'ın kendisinin otomatik verdiği değerler (elle girilmez) ---
@@ -161,6 +182,38 @@ async def ask_vision(history: list[dict], user_content) -> str:
     raise last_error
 
 
+@asynccontextmanager
+async def keep_alive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """İşlem sürerken 'yazıyor...' gösterir; her PROGRESS_INTERVAL saniyede
+    bir 'çalışmaya devam ediyorum' mesajı atar. İşlem bitince durur."""
+    chat_id = update.effective_chat.id
+
+    async def typing_loop():
+        # Telegram 'yazıyor...' göstergesi ~5 sn sürer, sürekli yenilenir
+        while True:
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    async def progress_loop():
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL)
+            try:
+                await update.message.reply_text(PROGRESS_TEXT)
+            except Exception:
+                logger.warning("İlerleme mesajı gönderilemedi")
+
+    tasks = [asyncio.create_task(typing_loop()), asyncio.create_task(progress_loop())]
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def send_reply(update: Update, text: str):
     for part in split_text(text):
         await update.message.reply_text(part)
@@ -194,12 +247,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kullanıcıdan gelen metni geçmişle birlikte yapay zekaya iletir."""
     user_text = f"{message_header(update)}\n{update.message.text}"
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
-    )
-
     try:
-        reply_text = await ask_llm(TEXT_MODEL, get_history(context), user_text)
+        async with keep_alive(update, context):
+            reply_text = await ask_llm(TEXT_MODEL, get_history(context), user_text)
     except Exception:
         logger.exception("Yapay zeka çağrısında hata oluştu (model: %s)", TEXT_MODEL)
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
@@ -217,9 +267,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. cevap: hemen gönderilir
     await msg.reply_text("Tamam, resmi aldım, işlemlere başlıyorum.")
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
-    )
 
     # Resmi indir: normal fotoğraf ya da "dosya olarak" gönderilmiş resim
     if msg.photo:
@@ -245,7 +292,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
-        reply_text = await ask_vision(get_history(context), user_content)
+        async with keep_alive(update, context):
+            reply_text = await ask_vision(get_history(context), user_content)
     except Exception:
         logger.exception("Hiçbir resim modeli yanıt veremedi: %s", VISION_MODELS)
         await msg.reply_text(
