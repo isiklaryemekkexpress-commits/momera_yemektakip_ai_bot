@@ -24,6 +24,9 @@ Dosyayı GitHub'da değiştirip kaydettiğinizde Render otomatik olarak yeniden 
 
 ## Resim gönderildiğinde yapılacaklar
 - Kullanıcı mesaj olarak bir resim gönderdiğinde, ayrıca bir komut beklemeden Google Drive'a (LISTBOT) ekleme sürecini otomatik olarak başlat ve aşağıdaki adımları uygula.
+- Resim geldiğinde kullanıcıya iki ayrı mesaj gider:
+  1. Hemen: "Tamam, resmi aldım, işlemlere başlıyorum." (bu mesajı kod gönderir)
+  2. İşlem bitince: onaya sunulan tablo (aşağıdaki adımlar).
 - Resimle birlikte metin de gelirse (örn. farklı tarih), bu bilgiyi süreçte kullan.
 - Resim yemek listesi değilse veya okunamıyorsa süreci başlatma; kullanıcıya kısaca bunu bildir.
 
