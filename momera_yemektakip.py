@@ -26,24 +26,35 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # AYARLAR — model ve davranış ayarları burada, kodun içinde.
 # Render > Environment'ta yalnızca gizli anahtarlar durur:
-#   TELEGRAM_BOT_TOKEN, EVREN_API_KEY  (WEBHOOK_SECRET opsiyonel)
+#   TELEGRAM_BOT_TOKEN ve seçili sağlayıcının anahtarı
+#   (grok -> GROK_API_KEY, evren -> EVREN_API_KEY), WEBHOOK_SECRET opsiyonel
 # ============================================================
 
-# EVREN LLM API adresi
-EVREN_BASE_URL = "https://evren-llmapi.ssyz.org.tr/v1"
+# Kullanılacak sağlayıcı: "grok" ya da "evren"
+PROVIDER = "grok"
 
-# Metin mesajları (düzeltme, onay, sorular) için model
-TEXT_MODEL = "deepseek-v4.1-flash"
+PROVIDERS = {
+    "grok": {
+        "base_url": "https://api.x.ai/v1",
+        "key_env": "GROK_API_KEY",
+        # Metin mesajları (düzeltme, onay, sorular) için model
+        "text_model": "grok-4",
+        # Resim okuma modelleri — sırayla denenir; ilki hata verirse sonrakine geçilir
+        "vision_models": ["grok-4"],
+    },
+    "evren": {
+        "base_url": "https://evren-llmapi.ssyz.org.tr/v1",
+        "key_env": "EVREN_API_KEY",
+        "text_model": "deepseek-v4.1-flash",
+        "vision_models": ["gemma-4-31b", "qwen3-vl-30b", "deepseek-v4.1-flash"],
+    },
+}
 
-# Resim okuma modelleri — sırayla denenir. İlki hata verirse (dolu, kapalı vb.)
-# bir sonrakine geçilir. Test sonucuna göre sıralamayı değiştirebilirsiniz.
-VISION_MODELS = [
-    "gemma-4-31b",          # el yazısı çözümleme, belge okuma
-    "qwen3-vl-30b",         # tablo / belge görsel akıl yürütme
-    "deepseek-v4.1-flash",  # yedek
-]
+CFG = PROVIDERS[PROVIDER]
+TEXT_MODEL = CFG["text_model"]
+VISION_MODELS = CFG["vision_models"]
 
-# Düşünen modellerde düşünme + yanıt aynı bütçeyi kullanır; EVREN en az 2048 önerir
+# Yanıt için token bütçesi (düşünen modellerde düşünme de bu bütçeden harcanır)
 MAX_TOKENS = 4096
 
 # Sohbet geçmişinde tutulacak en fazla mesaj sayısı (kullanıcı + bot)
@@ -56,7 +67,7 @@ TELEGRAM_MAX_LEN = 4096
 
 # --- Gizli anahtarlar (Render > Environment) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-EVREN_API_KEY = os.environ["EVREN_API_KEY"]
+API_KEY = os.environ[CFG["key_env"]]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # opsiyonel
 
 # --- Render'ın kendisinin otomatik verdiği değerler (elle girilmez) ---
@@ -83,12 +94,15 @@ def load_system_prompt() -> str:
 SYSTEM_PROMPT = load_system_prompt()
 
 client = AsyncOpenAI(
-    api_key=EVREN_API_KEY,
-    base_url=EVREN_BASE_URL,
-    # EVREN anahtarı X-API-Key başlığıyla beklenir
-    default_headers={"X-API-Key": EVREN_API_KEY},
+    api_key=API_KEY,
+    base_url=CFG["base_url"],
+    # EVREN anahtarı ayrıca X-API-Key başlığıyla da beklenir
+    default_headers={"X-API-Key": API_KEY} if PROVIDER == "evren" else None,
 )
-logger.info("EVREN — metin modeli: %s, resim modelleri: %s", TEXT_MODEL, VISION_MODELS)
+logger.info(
+    "Sağlayıcı: %s — metin modeli: %s, resim modelleri: %s",
+    PROVIDER, TEXT_MODEL, VISION_MODELS,
+)
 
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
