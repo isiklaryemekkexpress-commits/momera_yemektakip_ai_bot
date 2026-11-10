@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import difflib
+import unicodedata
 import json
 import re
 from datetime import datetime
@@ -63,6 +65,8 @@ VISION_CHAIN = [
 # Tablonun adresindeki ID: docs.google.com/spreadsheets/d/<BURASI>/edit
 SPREADSHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
 LISTBOT_SHEET = "LISTBOT"
+MATRIX_SHEET = "EslesmeMatrisi"  # A: LISTBOT'a kaydedilecek ad, B: resimde okunan ad
+FUZZY_THRESHOLD = 0.85  # yaklaşık eşleşme için benzerlik eşiği (0-1)
 TIMEZONE = ZoneInfo("Europe/Istanbul")
 
 # Kullanıcı bunlardan birini yazarsa liste kaydedilir (kod kontrol eder, yapay zeka değil)
@@ -398,10 +402,80 @@ def date_prefix(date: str) -> str:
     return f"{y[-2:]}{m.zfill(2)}{d.zfill(2)}"
 
 
-def open_listbot():
+def open_tab(name: str):
     if not SPREADSHEET_ID:
         raise RuntimeError("Kodda SPREADSHEET_ID boş.")
-    return sheets_client().open_by_key(SPREADSHEET_ID).worksheet(LISTBOT_SHEET)
+    sh = sheets_client().open_by_key(SPREADSHEET_ID)
+    # Sekme adı büyük/küçük harf ve boşluk farkı gözetmeden bulunur (ListBot = LISTBOT)
+    target = name.replace(" ", "").lower()
+    for ws in sh.worksheets():
+        if ws.title.replace(" ", "").lower() == target:
+            return ws
+    names = ", ".join(w.title for w in sh.worksheets())
+    raise RuntimeError(f"'{name}' sekmesi bulunamadı. Mevcut sekmeler: {names}")
+
+
+def open_listbot():
+    return open_tab(LISTBOT_SHEET)
+
+
+# --- Yemek adı eşleştirme (EslesmeMatrisi) ---
+def fold(text: str) -> str:
+    """Karşılaştırma için sadeleştirir: Türkçe karakter, büyük/küçük harf,
+    boşluk ve noktalama farklarını yok sayar. 'PİRİNÇ PİLAV' -> 'pirincpilav'"""
+    text = text.replace("İ", "i").replace("I", "i").lower()
+    text = text.translate(str.maketrans("çğıöşü", "cgiosu"))
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+WORD_INDEX: dict[tuple, str] = {}
+
+
+def load_matrix():
+    """EslesmeMatrisi'ni okur. Döndürür: (resmi adlar listesi, {sade ad: resmi ad}).
+    B kolonundaki '/' ile ayrılmış her alternatif ayrı eşleşme sayılır."""
+    rows = open_tab(MATRIX_SHEET).get_all_values()[1:]  # 1. satır başlık
+    official, lookup = [], {}
+    WORD_INDEX.clear()
+    for r in rows:
+        a = (r[0] if len(r) > 0 else "").strip()
+        b = (r[1] if len(r) > 1 else "").strip()
+        if not a:
+            continue
+        official.append(a)
+        for alt in [a] + b.split("/"):
+            if fold(alt):
+                lookup.setdefault(fold(alt), a)
+                WORD_INDEX.setdefault(tuple(sorted(fold(w) for w in alt.split() if fold(w))), a)
+    return official, lookup
+
+
+def match_name(read: str, lookup: dict) -> tuple[str, str]:
+    """Okunan adı resmi ada çevirir. Döndürür: (ad, not).
+    Bulunamazsa ad '?' ile başlar."""
+    raw = read.lstrip("?").strip()
+    key = fold(raw)
+    if not key:
+        return read, ""
+    # 1) Birebir eşleşme (A ya da B kolonu)
+    if key in lookup:
+        return lookup[key], ""
+    # 2) Aynı kelimeler farklı sırada (örn. "NOHUT ETLİ" = "Etli Nohut")
+    words = sorted(fold(w) for w in raw.split() if fold(w))
+    for alt, official in WORD_INDEX.items():
+        if words == list(alt):
+            return official, f"eşleşme: okunan '{raw}'"
+    # 3) Biri diğerini içeriyorsa ve tek bir resmi ada çıkıyorsa (örn. SCHNITZEL)
+    if len(key) >= 5:
+        hits = {v for k, v in lookup.items() if key in k or (len(k) >= 5 and k in key)}
+        if len(hits) == 1:
+            return hits.pop(), f"eşleşme: okunan '{raw}'"
+    # 4) Yazım hatasına dayanıklı yaklaşık eşleşme
+    best = difflib.get_close_matches(key, list(lookup), n=1, cutoff=FUZZY_THRESHOLD)
+    if best:
+        return lookup[best[0]], f"yaklaşık eşleşme: okunan '{raw}'"
+    return f"?{raw}", "eşleşme bulunamadı"
 
 
 FIELD_TO_KEY = {
@@ -483,11 +557,60 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sohbet geçmişi temizlendi. Yeni işleme başlayabilirsiniz.")
 
 
-def remember_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str):
-    """Yanıtta tablo varsa onay bekleyen liste olarak saklar."""
+TABLE_FOOTER = (
+    'Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05\'in adedi 11 olsun", '
+    '"tarih 09.11.2026 olsun"). Liste doğruysa "onay" yazın; liste LISTBOT tablosuna '
+    "yukarıdaki tarihle kaydedilecek."
+)
+
+
+def render_table(date: str, rows: list[dict], warning: str = "") -> str:
+    lines = [
+        "📋 LISTBOT tablosuna kaydedilecek liste",
+        f"📅 Kayıt tarihi: {date}",
+        "",
+        "ID | Yemek Adı | Adet | NOTE",
+    ]
+    for r in rows:
+        lines.append(f"{r['id']} | {r['name']} | {r['qty']} | {r['note']}".rstrip())
+    unmatched = sum(1 for r in rows if r["name"].startswith("?"))
+    lines += ["", f"Toplam: {len(rows)} satır"]
+    if unmatched:
+        lines.append(
+            f"❓ {unmatched} yemek EslesmeMatrisi'nde bulunamadı (başında ? olanlar). "
+            "Matrise ekleyip \"tekrar eşleştir\" yazabilir ya da ID ile adını düzeltebilirsiniz."
+        )
+    if warning:
+        lines.append(warning)
+    lines += ["", TABLE_FOOTER]
+    return "\n".join(lines)
+
+
+def apply_matching(rows: list[dict]) -> str:
+    """Satırlardaki adları EslesmeMatrisi'ne göre düzeltir. Uyarı metni döndürür."""
+    try:
+        _, lookup = load_matrix()
+    except Exception as e:
+        logger.exception("EslesmeMatrisi okunamadı")
+        return f"⚠️ EslesmeMatrisi okunamadı, adlar eşleştirilmedi ({e})."
+    for r in rows:
+        name, note = match_name(r["name"], lookup)
+        r["name"] = name
+        if note and note not in r["note"]:
+            r["note"] = f"{r['note']}; {note}" if r["note"] else note
+    return ""
+
+
+async def process_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str) -> str:
+    """Yanıtta tablo varsa: adları eşleştirir, bekleyen liste olarak saklar ve
+    kullanıcıya gösterilecek standart tabloyu döndürür. Tablo yoksa metni aynen döndürür."""
     parsed = parse_table(reply_text)
-    if parsed:
-        context.chat_data["pending"] = parsed
+    if not parsed:
+        return reply_text
+    date, rows = parsed
+    warning = await asyncio.to_thread(apply_matching, rows)
+    context.chat_data["pending"] = (date, rows)
+    return render_table(date, rows, warning)
 
 
 # --- Onay ve kayıt (yapay zeka değil, kod yapar) ---
@@ -530,6 +653,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_pending(update, context)
         return
 
+    # Matris güncellendiyse bekleyen listeyi yeniden eşleştir
+    if fold(text) in {"tekrareslestir", "yenideneslestir", "eslestir"} and context.chat_data.get("pending"):
+        date, rows = context.chat_data["pending"]
+        warning = await asyncio.to_thread(apply_matching, rows)
+        table = render_table(date, rows, warning)
+        add_to_history(context, "assistant", table)
+        await send_reply(update, table)
+        return
+
     # Bekleyen liste yoksa: kayıtlı satırlarda düzeltme isteği olabilir
     if not context.chat_data.get("pending") and await try_saved_edit(update, context, text):
         return
@@ -547,7 +679,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
-    remember_table(context, reply_text)
+    reply_text = await process_table(context, reply_text)
     add_to_history(context, "user", user_text)
     add_to_history(context, "assistant", reply_text)
     await send_reply(update, reply_text)
@@ -574,8 +706,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
     user_text = f"{message_header(update)}\nKullanıcının notu: {caption or '(yok)'}"
+    vocab = ""
+    try:
+        official, _ = await asyncio.to_thread(load_matrix)
+        vocab = (
+            "\n\nBilinen yemek adları (okurken yardımcı olsun diye; resimde ne yazıyorsa "
+            "onu yaz, eşleştirmeyi sistem yapar): " + ", ".join(official)
+        )
+    except Exception:
+        logger.warning("EslesmeMatrisi okunamadı, ipucu listesi olmadan devam ediliyor")
     user_content = [
-        {"type": "text", "text": f"{user_text}\n\n{PHOTO_INSTRUCTION}"},
+        {"type": "text", "text": f"{user_text}\n\n{PHOTO_INSTRUCTION}{vocab}"},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
     ]
 
@@ -591,7 +732,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Yeni resim önceki bekleyen listeyi değiştirir
     context.chat_data.pop("pending", None)
-    remember_table(context, reply_text)
+    reply_text = await process_table(context, reply_text)
 
     # Geçmişe resmin kendisi değil, sadece metni yazılır (boyut büyümesin diye)
     add_to_history(context, "user", f"{user_text}\n[Resim gönderildi]")
