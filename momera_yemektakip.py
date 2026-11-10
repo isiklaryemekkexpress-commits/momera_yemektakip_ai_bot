@@ -72,6 +72,9 @@ TIMEZONE = ZoneInfo("Europe/Istanbul")
 # Kullanıcı bunlardan birini yazarsa liste kaydedilir (kod kontrol eder, yapay zeka değil)
 APPROVAL_WORDS = {"onay", "onayla", "onaylıyorum", "onaylandı", "kaydet", "evet kaydet", "tamam kaydet"}
 
+# Bir modelin yanıtı için en fazla bekleme süresi (saniye); aşılırsa sıradaki modele geçilir
+AI_TIMEOUT = 180
+
 # Sohbet geçmişinde tutulacak en fazla mesaj sayısı (kullanıcı + bot)
 MAX_HISTORY = 20
 
@@ -121,6 +124,8 @@ def build_clients() -> dict[str, AsyncOpenAI]:
         clients[name] = AsyncOpenAI(
             api_key=key,
             base_url=cfg["base_url"],
+            timeout=AI_TIMEOUT,
+            max_retries=1,
             # EVREN anahtarı ayrıca X-API-Key başlığıyla da beklenir
             default_headers={"X-API-Key": key} if name == "evren" else None,
         )
@@ -687,52 +692,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Resim mesajları ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resim gelince: 1) hemen 'başlıyorum' der, 2) resmi okutup tabloyu gönderir."""
+    """Resim gelince: 1) hemen 'başlıyorum' der, 2) resmi okutup tabloyu gönderir.
+    İndirme, matris okuma ve yapay zeka adımlarının hepsi 'devam ediyorum'
+    mesajlarının kapsamındadır; herhangi bir adım hata verirse kullanıcıya bildirilir."""
     msg = update.message
 
     # 1. cevap: hemen gönderilir
     await msg.reply_text("Tamam, resmi aldım, işlemlere başlıyorum.")
 
-    # Resmi indir: normal fotoğraf ya da "dosya olarak" gönderilmiş resim
-    if msg.photo:
-        tg_file = await msg.photo[-1].get_file()  # en yüksek çözünürlük
-        mime = "image/jpeg"
-    else:
-        tg_file = await msg.document.get_file()
-        mime = msg.document.mime_type or "image/jpeg"
-
-    img_bytes = await tg_file.download_as_bytearray()
-    img_b64 = base64.b64encode(img_bytes).decode()
-
     caption = msg.caption or ""
     user_text = f"{message_header(update)}\nKullanıcının notu: {caption or '(yok)'}"
-    vocab = ""
-    try:
-        official, _ = await asyncio.to_thread(load_matrix)
-        vocab = (
-            "\n\nBilinen yemek adları (okurken yardımcı olsun diye; resimde ne yazıyorsa "
-            "onu yaz, eşleştirmeyi sistem yapar): " + ", ".join(official)
-        )
-    except Exception:
-        logger.warning("EslesmeMatrisi okunamadı, ipucu listesi olmadan devam ediliyor")
-    user_content = [
-        {"type": "text", "text": f"{user_text}\n\n{PHOTO_INSTRUCTION}{vocab}"},
-        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-    ]
-
+    step = "resim indirilirken"
     try:
         async with keep_alive(update, context):
+            # Resmi indir: normal fotoğraf ya da "dosya olarak" gönderilmiş resim
+            if msg.photo:
+                tg_file = await msg.photo[-1].get_file()  # en yüksek çözünürlük
+                mime = "image/jpeg"
+            else:
+                tg_file = await msg.document.get_file()
+                mime = msg.document.mime_type or "image/jpeg"
+            img_bytes = await tg_file.download_as_bytearray()
+            img_b64 = base64.b64encode(img_bytes).decode()
+            logger.info("Resim indirildi (%d KB)", len(img_bytes) // 1024)
+
+            step = "yemek listesi (EslesmeMatrisi) okunurken"
+            vocab = ""
+            try:
+                official, _ = await asyncio.wait_for(asyncio.to_thread(load_matrix), timeout=30)
+                vocab = (
+                    "\n\nBilinen yemek adları (okurken yardımcı olsun diye; resimde ne yazıyorsa "
+                    "onu yaz, eşleştirmeyi sistem yapar): " + ", ".join(official)
+                )
+            except Exception as e:
+                logger.warning("EslesmeMatrisi okunamadı, ipucu listesi olmadan devam: %s", e)
+
+            step = "resim yapay zekaya okutulurken"
+            user_content = [
+                {"type": "text", "text": f"{user_text}\n\n{PHOTO_INSTRUCTION}{vocab}"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+            ]
             reply_text = await ask_chain(VISION_CHAIN, get_history(context), user_content)
-    except Exception:
-        logger.exception("Hiçbir resim modeli yanıt veremedi")
+
+            step = "yemek adları eşleştirilirken"
+            context.chat_data.pop("pending", None)  # yeni resim önceki listeyi değiştirir
+            reply_text = await process_table(context, reply_text)
+    except Exception as e:
+        logger.exception("Resim işlenemedi (%s)", step)
         await msg.reply_text(
-            "Üzgünüm, resmi işlerken bir hata oluştu. Lütfen tekrar deneyin."
+            f"Üzgünüm, {step} bir hata oluştu, lütfen tekrar deneyin.\nHata: {str(e)[:300]}"
         )
         return
-
-    # Yeni resim önceki bekleyen listeyi değiştirir
-    context.chat_data.pop("pending", None)
-    reply_text = await process_table(context, reply_text)
 
     # Geçmişe resmin kendisi değil, sadece metni yazılır (boyut büyümesin diye)
     add_to_history(context, "user", f"{user_text}\n[Resim gönderildi]")
@@ -742,9 +752,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_reply(update, reply_text)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Yakalanmamış her hatayı loglar ve kullanıcıya sessiz kalmak yerine bildirir."""
+    logger.exception("Beklenmeyen hata", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                f"Üzgünüm, beklenmeyen bir hata oluştu: {str(context.error)[:300]}"
+            )
+        except Exception:
+            pass
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("yeni", reset))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
