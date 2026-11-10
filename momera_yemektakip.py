@@ -61,7 +61,7 @@ VISION_CHAIN = [
 
 # --- Google Sheets ---
 # Tablonun adresindeki ID: docs.google.com/spreadsheets/d/<BURASI>/edit
-SPREADSHEET_ID = ""  # TODO: Google Sheet ID'sini buraya yazın
+SPREADSHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
 LISTBOT_SHEET = "LISTBOT"
 TIMEZONE = ZoneInfo("Europe/Istanbul")
 
@@ -291,6 +291,54 @@ EDIT_INSTRUCTION = """[Sistem notu: Onay bekleyen bir liste var. Kullanıcı dü
 """ + TABLE_FORMAT
 
 
+SAVED_EDIT_INSTRUCTION = """[Sistem görevi] Kullanıcının son mesajı, LISTBOT tablosuna DAHA ÖNCE KAYDEDİLMİŞ satırlarda değişiklik isteği mi?
+Kayıtlı satırların NO değeri "{prefix}-ID" biçimindedir (ID 2 basamaklı, örn. 17 -> {prefix}-17). Kullanıcı tam NO yazarsa (örn. 261109-05) onu kullan.
+Değiştirilebilir alanlar: "adet", "yemek adı", "note", "tarih". Silme için "action": "sil".
+
+SADECE JSON döndür, başka hiçbir şey yazma:
+{{"edits": [{{"no": "{prefix}-17", "field": "adet", "value": "12"}}, {{"no": "{prefix}-05", "action": "sil"}}]}}
+Mesaj bir değişiklik isteği değilse: {{"edits": []}}"""
+
+
+def extract_json(text: str):
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+async def try_saved_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Kayıtlı satır düzeltmesi ise tabloda uygular ve True döner."""
+    if not re.search(r"\d", text):
+        return False
+    prefix = context.chat_data.get("saved_prefix") or date_prefix(today_str())
+    instruction = SAVED_EDIT_INSTRUCTION.format(prefix=prefix)
+    try:
+        reply = await ask_chain(TEXT_CHAIN, [], f"Kullanıcı mesajı: {text}\n\n{instruction}")
+    except Exception:
+        logger.exception("Düzeltme isteği çözümlenemedi")
+        return False
+    data = extract_json(reply) or {}
+    edits = data.get("edits") or []
+    if not edits:
+        return False
+    try:
+        async with keep_alive(update, context):
+            results = await asyncio.to_thread(update_listbot, edits)
+    except Exception as e:
+        logger.exception("LISTBOT güncellemesi başarısız")
+        await update.message.reply_text(f"❌ Tablo güncellenemedi, değişiklik yapılmadı.\nHata: {e}")
+        return True
+    msg = "LISTBOT tablosu güncellendi:\n" + "\n".join(results)
+    add_to_history(context, "user", text)
+    add_to_history(context, "assistant", f"[Sistem] {msg}")
+    await send_reply(update, msg)
+    return True
+
+
 # --- Tabloyu metinden okuma ---
 ROW_RE = re.compile(r"^\s*\**\s*(\d{1,3})\s*\**\s*\|\s*(.*?)\s*\|\s*(.*?)\s*(?:\|\s*(.*?)\s*)?\|?\s*$")
 DATE_RE = re.compile(r"Kayıt tarihi:\s*\**\s*(\d{1,2}[./]\d{1,2}[./]\d{4})", re.IGNORECASE)
@@ -344,19 +392,71 @@ def sheets_client():
     return _gc
 
 
-def append_to_listbot(date: str, rows: list[dict]) -> int:
-    """Satırları LISTBOT sekmesine ekler. Sütunları başlık satırına göre eşleştirir."""
+def date_prefix(date: str) -> str:
+    """10.11.2026 -> 261110 (yymmdd)"""
+    d, m, y = date.split(".")
+    return f"{y[-2:]}{m.zfill(2)}{d.zfill(2)}"
+
+
+def open_listbot():
     if not SPREADSHEET_ID:
         raise RuntimeError("Kodda SPREADSHEET_ID boş.")
-    ws = sheets_client().open_by_key(SPREADSHEET_ID).worksheet(LISTBOT_SHEET)
+    return sheets_client().open_by_key(SPREADSHEET_ID).worksheet(LISTBOT_SHEET)
+
+
+FIELD_TO_KEY = {
+    "adet": "qty", "yemek adı": "name", "yemek adi": "name", "yemek": "name",
+    "note": "note", "not": "note", "tarih": "date",
+}
+
+
+def update_listbot(edits: list[dict]) -> list[str]:
+    """Kayıtlı satırları NO değerine göre bulup günceller veya siler.
+    Her düzenleme için sonucu anlatan bir satır döndürür."""
+    ws = open_listbot()
+    header = ws.row_values(1)
+    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    if "no" not in keys:
+        raise RuntimeError("LISTBOT'ta NO kolonu bulunamadı.")
+    no_col = keys.index("no") + 1
+    results, deletes = [], []
+    no_values = ws.col_values(no_col)
+    for e in edits:
+        no = str(e.get("no", "")).strip()
+        try:
+            row = no_values.index(no) + 1
+        except ValueError:
+            results.append(f"⚠️ {no}: LISTBOT'ta bulunamadı, değişiklik yapılmadı.")
+            continue
+        if e.get("action") == "sil":
+            deletes.append((row, no))
+            continue
+        key = FIELD_TO_KEY.get(str(e.get("field", "")).strip().lower())
+        if key not in keys:
+            results.append(f"⚠️ {no}: '{e.get('field')}' alanı tanınmadı.")
+            continue
+        col = keys.index(key) + 1
+        old = ws.cell(row, col).value or ""
+        new = e.get("value", "")
+        ws.update_cell(row, col, new)
+        results.append(f"✏️ {no}: {header[col - 1]} '{old}' → '{new}'")
+    # Silmeleri alttan üste yap ki satır numaraları kaymasın
+    for row, no in sorted(deletes, reverse=True):
+        ws.delete_rows(row)
+        results.append(f"🗑️ {no}: satır silindi")
+    return results
+
+
+def append_to_listbot(date: str, rows: list[dict]) -> int:
+    """Satırları LISTBOT sekmesine ekler. Sütunları başlık satırına göre eşleştirir."""
+    ws = open_listbot()
     header = ws.row_values(1)
     if not header:
         header = ["NO", "Tarih", "Yemek Adı", "Adet", "NOTE"]
         ws.append_row(header)
     keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
     values = []
-    d, m, y = date.split(".")
-    prefix = f"{y[-2:]}{m.zfill(2)}{d.zfill(2)}"  # yymmdd, örn. 10.11.2026 -> 261110
+    prefix = date_prefix(date)
     for r in rows:
         data = {
             "no": f"{prefix}-{r['id']}",  # örn. 261110-05
@@ -412,7 +512,12 @@ async def save_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     context.chat_data.pop("pending", None)
-    msg = f"✅ Kayıt tamamlandı: {count} satır {date} tarihiyle LISTBOT tablosuna eklendi."
+    context.chat_data["saved_prefix"] = date_prefix(date)
+    msg = (
+        f"✅ Kayıt tamamlandı: {count} satır {date} tarihiyle LISTBOT tablosuna eklendi.\n"
+        f"Satırlar NO kolonunda {date_prefix(date)}-ID olarak kayıtlı. Düzeltme gerekirse "
+        "yazmanız yeterli (örn. \"17'nin adedi 12 olsun\"), doğrudan tabloda güncellerim."
+    )
     add_to_history(context, "assistant", f"[Sistem] {msg}")
     await update.message.reply_text(msg)
 
@@ -423,6 +528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.lower().rstrip(".!") in APPROVAL_WORDS:
         await save_pending(update, context)
+        return
+
+    # Bekleyen liste yoksa: kayıtlı satırlarda düzeltme isteği olabilir
+    if not context.chat_data.get("pending") and await try_saved_edit(update, context, text):
         return
 
     user_text = f"{message_header(update)}\n{text}"
