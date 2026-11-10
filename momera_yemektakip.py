@@ -227,6 +227,26 @@ def message_header(update: Update) -> str:
     return f"[Mesaj tarihi: {tarih} | Gönderen: {gonderen}]"
 
 
+# Resim gelince modele verilen kesin talimat. Kurallar dosyası yüklenemese
+# bile botun tabloyu gösterip onay istemesini garanti eder.
+PHOTO_INSTRUCTION = """Kullanıcı yemek listesi resmi gönderdi. Kurallardaki 'Resim gönderildiğinde yapılacaklar' ve 'Kayıt öncesi onay' adımlarını uygula.
+
+ÖNEMLİ:
+- Şu an SADECE önizleme hazırlıyorsun. Hiçbir yere kayıt yapmadın ve yapamazsın; kayıt, kullanıcı onay verdikten sonra sistem tarafından yapılır.
+- "kaydedildi", "işlendi", "yüklendi" gibi ifadeler KULLANMA.
+- Resimdeki her yemek satırını tek tek yaz; özet verme.
+
+Yanıtını tam olarak şu biçimde ver:
+
+📋 Okunan liste (Tarih: GG.AA.YYYY)
+
+ID | Yemek Adı | Adet | NOTE
+01 | <yemek adı> | <adet> | <hesap / not>
+02 | ...
+
+Düzeltme isteğiniz var mı? ID numarasıyla yazabilirsiniz (örn. "05'in adedi 11 olsun"). Liste doğruysa "onay" yazın."""
+
+
 # --- Komutlar ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start komutu verildiğinde çalışır."""
@@ -282,9 +302,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = msg.caption or ""
     user_text = (
         f"{message_header(update)}\n"
-        "Kullanıcı yemek listesi resmi gönderdi. Kurallardaki "
-        "'Resim gönderildiğinde yapılacaklar' sürecini uygula.\n"
-        f"Kullanıcının notu: {caption or '(yok)'}"
+        f"Kullanıcının notu: {caption or '(yok)'}\n\n"
+        + PHOTO_INSTRUCTION
     )
     user_content = [
         {"type": "text", "text": user_text},
