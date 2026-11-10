@@ -51,8 +51,9 @@ TEXT_CHAIN = [
     ("groq", "qwen/qwen3.8-27b", 900),
     ("evren", "deepseek-v4.1-flash", 4096),
 ]
+# Groq resim için kullanılmıyor: ücretsiz katmandaki 900 token sınırı
+# 40+ satırlık listeye yetmiyor ve model listeyi kısaltıyor.
 VISION_CHAIN = [
-    ("groq", "qwen/qwen3.8-27b", 900),
     ("evren", "gemma-4-31b", 4096),      # el yazısı çözümleme
     ("evren", "qwen3-vl-30b", 4096),     # tablo / belge okuma
     ("evren", "deepseek-v4.1-flash", 4096),
@@ -270,7 +271,18 @@ PHOTO_INSTRUCTION = """Kullanıcı yemek listesi resmi gönderdi. Kurallardaki '
 ÖNEMLİ:
 - Şu an SADECE önizleme hazırlıyorsun. Kayıt, kullanıcı "onay" yazınca sistem tarafından yapılır.
 - "kaydedildi", "işlendi", "yüklendi", "onaylandı" gibi ifadeler KULLANMA.
-- Resimdeki her yemek satırını tek tek yaz; özet verme.
+- Resimdeki her yemek satırını tek tek yaz; özet verme, satır atlama.
+
+RESMİ OKUMA KURALLARI:
+- Form yukarıdan aşağıya numaralı satırlardan oluşur (1, 2, 3 … 45 gibi). Formun TAMAMINI en üst satırdan en alt satıra kadar oku; sadece bir bölümünü değil.
+- ID olarak satırın solundaki basılı satır numarasını kullan (örn. 01, 02, 17, 34).
+- Basılı satır numarasının sağında sayı (adet), onun sağında yemek adı bulunur.
+- Yemek adı ve adedi boş olan satırları ATLA, tabloya yazma.
+- Sol kenardaki dikey yazılar (örn. "ETLİ YEMEKLER", "ÇORBA", "TATLI-MEZE", "PİLAV-MAKARNA") bölüm başlığıdır, yemek DEĞİLDİR; tabloya yazma.
+- Sayfadaki el yazısı satırlar (yemek adı + sayı) da birer yemek satırıdır; bunları da ekle ve NOTE'a "el yazısı" yaz.
+- Yazının yanındaki el yazısı düzeltmeleri (örn. "+5 fazla gönderildi", "-10 eksik") NOTE'a yaz ve adedi kurallara göre hesapla.
+- Okuyamadığın kelimeyi uydurma; başına "?" koy ve NOTE'a "okunamadı" yaz.
+- Yanıtı bitirmeden önce resimdeki dolu satır sayısıyla tablodaki satır sayısını karşılaştır; eksik varsa ekle.
 
 """ + TABLE_FORMAT
 
