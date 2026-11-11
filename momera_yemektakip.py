@@ -66,6 +66,7 @@ VISION_CHAIN = [
 SPREADSHEET_ID = "1ryMqkQPGOvFcl5k9t46pF98dHM6WMntPVi4ZN9RB0nw"
 LISTBOT_SHEET = "ListBot"
 MATRIX_SHEET = "EslesmeMatrisi"  # A: ListBot'a kaydedilecek ad, B: resimde okunan ad
+STATE_SHEET = "BotDurum"  # bekleyen liste ve sohbet geçmişi burada saklanır (yoksa bot oluşturur)
 FUZZY_THRESHOLD = 0.85  # yaklaşık eşleşme için benzerlik eşiği (0-1)
 TIMEZONE = ZoneInfo("Europe/Istanbul")
 
@@ -546,6 +547,177 @@ def append_to_listbot(date: str, rows: list[dict]) -> int:
     return len(values)
 
 
+# --- Durum saklama (Render yeniden başlasa da liste kaybolmasın) ---
+# Bekleyen liste, son kayıt tarihi ve sohbet geçmişi Google Sheet'teki
+# BotDurum sekmesinde sohbet başına bir satırda JSON olarak tutulur.
+STATE_CELL_LIMIT = 45_000  # Google Sheets hücre sınırı 50.000 karakter
+
+
+def state_snapshot(chat_data: dict) -> str:
+    state = {
+        "pending": chat_data.get("pending"),
+        "saved_prefix": chat_data.get("saved_prefix"),
+        "history": list(chat_data.get("history", [])),
+    }
+    text = json.dumps(state, ensure_ascii=False)
+    while len(text) > STATE_CELL_LIMIT and state["history"]:
+        state["history"].pop(0)
+        text = json.dumps(state, ensure_ascii=False)
+    return text
+
+
+def open_state_tab():
+    try:
+        return open_tab(STATE_SHEET)
+    except RuntimeError:
+        sh = sheets_client().open_by_key(SPREADSHEET_ID)
+        ws = sh.add_worksheet(title=STATE_SHEET, rows=50, cols=3)
+        ws.append_row(["chat_id", "durum (bot kullanır, elle değiştirmeyin)", "güncelleme"])
+        return ws
+
+
+def load_state_row(chat_id: int):
+    ws = open_state_tab()
+    ids = ws.col_values(1)
+    if str(chat_id) in ids:
+        raw = ws.cell(ids.index(str(chat_id)) + 1, 2).value or ""
+        return json.loads(raw) if raw else None
+    return None
+
+
+def save_state_row(chat_id: int, text: str):
+    ws = open_state_tab()
+    ids = ws.col_values(1)
+    stamp = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+    if str(chat_id) in ids:
+        row = ids.index(str(chat_id)) + 1
+        ws.update(f"B{row}:C{row}", [[text, stamp]])
+    else:
+        ws.append_row([str(chat_id), text, stamp])
+
+
+async def restore_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.chat_data.get("_state_loaded"):
+        return
+    context.chat_data["_state_loaded"] = True
+    try:
+        state = await asyncio.wait_for(
+            asyncio.to_thread(load_state_row, update.effective_chat.id), timeout=30)
+    except Exception as e:
+        logger.warning("Kayıtlı durum okunamadı: %s", e)
+        return
+    if not state:
+        return
+    if state.get("pending"):
+        date, rows = state["pending"]
+        context.chat_data["pending"] = (date, rows)
+    if state.get("saved_prefix"):
+        context.chat_data["saved_prefix"] = state["saved_prefix"]
+    if state.get("history"):
+        context.chat_data["history"] = state["history"][-MAX_HISTORY:]
+    logger.info("Durum geri yüklendi (bekleyen liste: %s)", bool(state.get("pending")))
+
+
+async def persist_state(update: Update, context: ContextTypes.DEFAULT_TYPE, before: str):
+    after = state_snapshot(context.chat_data)
+    if after == before:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(save_state_row, update.effective_chat.id, after), timeout=30)
+    except Exception as e:
+        logger.warning("Durum kaydedilemedi: %s", e)
+
+
+def with_state(handler):
+    """Handler'dan önce durumu geri yükler, sonra değiştiyse kaydeder."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_chat:
+            return await handler(update, context)
+        await restore_state(update, context)
+        before = state_snapshot(context.chat_data)
+        try:
+            await handler(update, context)
+        finally:
+            await persist_state(update, context, before)
+    return wrapper
+
+
+# --- EslesmeMatrisi'ne sohbetten ekleme ---
+MATRIX_ADD_INSTRUCTION = """[Sistem görevi] Kullanıcı EslesmeMatrisi'ne yemek eklemek / eşleşme tanımlamak istiyor mu?
+EslesmeMatrisi'nde A kolonu ListBot'a kaydedilecek resmi ad, B kolonu resimde okunan ad(lar)dır.
+- "official": ListBot'a kaydedilecek ad (düzgün yazım, örn. "Kıymalı Makarna").
+- "read": resimde okunabilecek yazımlar listesi. Kullanıcı belirtmediyse boş bırak.
+Örnek: "BASMATİ okunursa Basmati Pilavı olsun" -> {{"add": [{{"official": "Basmati Pilavı", "read": ["BASMATİ"]}}]}}
+SADECE JSON döndür. Ekleme isteği değilse: {{"add": []}}
+
+Kullanıcı mesajı: {text}"""
+
+
+def add_to_matrix(items: list[dict]) -> list[str]:
+    ws = open_tab(MATRIX_SHEET)
+    values = ws.get_all_values()
+    results = []
+    for it in items:
+        official = str(it.get("official", "")).strip()
+        if not official:
+            continue
+        reads = [str(r).strip() for r in (it.get("read") or []) if str(r).strip()]
+        if not reads:
+            reads = [official.replace("i", "İ").upper()]
+        row_idx = next((i for i, r in enumerate(values) if i > 0 and r and fold(r[0]) == fold(official)), None)
+        if row_idx is None:
+            ws.append_row([official, "/ ".join(reads)])
+            values.append([official, "/ ".join(reads)])
+            results.append(f"➕ Yeni satır: {official} ← {', '.join(reads)}")
+        else:
+            current = values[row_idx][1] if len(values[row_idx]) > 1 else ""
+            alts = [a.strip() for a in current.split("/") if a.strip()]
+            new = [r for r in reads if fold(r) not in {fold(a) for a in alts}]
+            if not new:
+                results.append(f"ℹ️ {values[row_idx][0]} zaten matriste, okunuşlar da kayıtlı.")
+                continue
+            joined = "/ ".join(alts + new)
+            ws.update_cell(row_idx + 1, 2, joined)
+            values[row_idx] = [values[row_idx][0], joined]
+            results.append(f"✏️ {values[row_idx][0]}: okunuş eklendi ← {', '.join(new)}")
+    return results
+
+
+async def try_matrix_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    f = fold(text)
+    if "matris" not in f and "eslesme" not in f:
+        return False
+    try:
+        reply = await ask_chain(TEXT_CHAIN, [], MATRIX_ADD_INSTRUCTION.format(text=text))
+    except Exception:
+        logger.exception("Matris isteği çözümlenemedi")
+        return False
+    items = (extract_json(reply) or {}).get("add") or []
+    if not items:
+        return False
+    try:
+        async with keep_alive(update, context):
+            results = await asyncio.to_thread(add_to_matrix, items)
+    except Exception as e:
+        logger.exception("EslesmeMatrisi güncellenemedi")
+        await update.message.reply_text(f"❌ EslesmeMatrisi güncellenemedi.\nHata: {e}")
+        return True
+    msg = "EslesmeMatrisi güncellendi:\n" + "\n".join(results)
+    add_to_history(context, "user", text)
+    add_to_history(context, "assistant", f"[Sistem] {msg}")
+    await send_reply(update, msg)
+    # Bekleyen liste varsa yeni matrisle hemen yeniden eşleştir
+    pending = context.chat_data.get("pending")
+    if pending:
+        date, rows = pending
+        warning = await asyncio.to_thread(apply_matching, rows)
+        table = render_table(date, rows, warning)
+        add_to_history(context, "assistant", table)
+        await send_reply(update, "Bekleyen liste yeni matrisle güncellendi:\n\n" + table)
+    return True
+
+
 # --- Komutlar ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start komutu verildiğinde çalışır."""
@@ -684,6 +856,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         table = render_table(date, rows, warning)
         add_to_history(context, "assistant", table)
         await send_reply(update, table)
+        return
+
+    # EslesmeMatrisi'ne ekleme isteği
+    if await try_matrix_add(update, context, text):
         return
 
     # Bekleyen liste yoksa: kayıtlı satırlarda düzeltme isteği olabilir
@@ -885,9 +1061,9 @@ def main():
 
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("yeni", reset))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("yeni", with_state(reset)))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, with_state(handle_photo)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, with_state(handle_message)))
 
     if RENDER_EXTERNAL_URL:
         # Render (Web Service): webhook modu, Render'ın verdiği PORT'u dinler
