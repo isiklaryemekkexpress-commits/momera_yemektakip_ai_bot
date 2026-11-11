@@ -391,6 +391,34 @@ HEADER_ALIASES = {
 _gc = None
 
 
+def header_keys(header: list[str]) -> list:
+    """ListBot başlıklarını alan adlarına çevirir. Birebir eşleşmeye ek olarak
+    "Gelen Adet", "Kayıt Tarihi" gibi başlıkları içerdiği kelimeden tanır.
+    Kurallar öncelik sırasıyla uygulanır (örn. "Gelen Adet", "Tüketilen Adet"ten önce gelir)."""
+    folded = [fold(h) for h in header]
+    keys = [None] * len(header)
+    rules = [  # (alan, başlık koşulu) — yukarıdan aşağı öncelik
+        ("no", lambda f: f in ("no", "numara")),
+        ("note", lambda f: f in ("note", "not", "notlar", "aciklama")),
+        ("qty", lambda f: f in ("adet", "gelenadet")),
+        ("qty", lambda f: "gelen" in f and "adet" in f),
+        ("qty", lambda f: "adet" in f or "miktar" in f),
+        ("date", lambda f: f == "tarih"),
+        ("date", lambda f: "tarih" in f),
+        ("name", lambda f: f in ("yemekadi", "yemek")),
+        ("name", lambda f: "yemek" in f),
+        ("note", lambda f: "note" in f or "aciklama" in f),
+    ]
+    for key, cond in rules:
+        if key in keys:
+            continue
+        for i, f in enumerate(folded):
+            if keys[i] is None and cond(f):
+                keys[i] = key
+                break
+    return keys
+
+
 def sheets_client():
     global _gc
     if _gc is None:
@@ -495,7 +523,7 @@ def update_listbot(edits: list[dict]) -> list[str]:
     Her düzenleme için sonucu anlatan bir satır döndürür."""
     ws = open_listbot()
     header = ws.row_values(1)
-    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    keys = header_keys(header)
     if "no" not in keys:
         raise RuntimeError("ListBot'ta NO kolonu bulunamadı.")
     no_col = keys.index("no") + 1
@@ -534,7 +562,14 @@ def append_to_listbot(date: str, rows: list[dict]) -> int:
     if not header:
         header = ["NO", "Tarih", "Yemek Adı", "Adet", "NOTE"]
         ws.append_row(header)
-    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    keys = header_keys(header)
+    missing = [n for k, n in (("name", "Yemek Adı"), ("qty", "Adet"), ("date", "Tarih")) if k not in keys]
+    if missing:
+        raise RuntimeError(
+            f"ListBot'ta şu kolonlar bulunamadı: {', '.join(missing)}. "
+            f"Mevcut başlıklar: {', '.join(header)}"
+        )
+    logger.info("ListBot kolon eşlemesi: %s", dict(zip(header, keys)))
     values = []
     prefix = date_prefix(date)
     for r in rows:
@@ -919,7 +954,7 @@ def read_listbot_all() -> str:
     if len(values) < 2:
         return ""
     header, rows = values[0], [r for r in values[1:] if any(c.strip() for c in r)]
-    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    keys = header_keys(header)
     col = {k: i for i, k in enumerate(keys) if k}
 
     # Kodla hesaplanan özetler (yapay zekanın toplama hatası yapmaması için)
