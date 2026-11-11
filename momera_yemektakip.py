@@ -591,7 +591,7 @@ def render_table(date: str, rows: list[dict], warning: str = "") -> str:
     return "\n".join(lines)
 
 
-def apply_matching(rows: list[dict]) -> str:
+def apply_matching(rows: list[dict], user_renamed: set = frozenset()) -> str:
     """Satırlardaki adları EslesmeMatrisi'ne göre düzeltir. Uyarı metni döndürür."""
     try:
         _, lookup = load_matrix()
@@ -600,14 +600,19 @@ def apply_matching(rows: list[dict]) -> str:
         return f"⚠️ EslesmeMatrisi okunamadı, adlar eşleştirilmedi ({e})."
     for r in rows:
         name, note = match_name(r["name"], lookup)
-        r["name"] = name
+        if r["id"] in user_renamed and name.startswith("?"):
+            # Kullanıcı bilerek bu adı verdi; olduğu gibi kaydet
+            r["name"] = r["name"].lstrip("?").strip()
+            note = "kullanıcı düzeltti (matriste yok)"
+        else:
+            r["name"] = name
         if note and note not in r["note"]:
             r["note"] = f"{r['note']}; {note}" if r["note"] else note
     return ""
 
 
 async def process_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str,
-                        renumber: bool = False) -> str:
+                        renumber: bool = False, previous=None) -> str:
     """Yanıtta tablo varsa: adları eşleştirir, bekleyen liste olarak saklar ve
     kullanıcıya gösterilecek standart tabloyu döndürür. Tablo yoksa metni aynen döndürür."""
     parsed = parse_table(reply_text)
@@ -619,7 +624,14 @@ async def process_table(context: ContextTypes.DEFAULT_TYPE, reply_text: str,
         # Düzeltmelerde ise ID'ler değişmez (kullanıcının elindeki numaralar kaymasın).
         for i, r in enumerate(rows, 1):
             r["id"] = f"{i:02d}"
-    warning = await asyncio.to_thread(apply_matching, rows)
+    # Kullanıcının ID ile değiştirdiği adlar: matriste karşılığı yoksa bile
+    # "?" eklenmez, kullanıcının yazdığı ad aynen kullanılır.
+    user_renamed = set()
+    if previous:
+        old_names = {r["id"]: r["name"] for r in previous[1]}
+        user_renamed = {r["id"] for r in rows
+                        if r["id"] in old_names and r["name"] != old_names[r["id"]]}
+    warning = await asyncio.to_thread(apply_matching, rows, user_renamed)
     context.chat_data["pending"] = (date, rows)
     return render_table(date, rows, warning)
 
@@ -680,21 +692,118 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = f"{message_header(update)}\n{text}"
     model_text = user_text
-    if context.chat_data.get("pending"):
+    chain = TEXT_CHAIN
+    previous = context.chat_data.get("pending")
+    if previous:
         model_text = f"{user_text}\n\n{EDIT_INSTRUCTION}"
+    else:
+        # Genel soru: ListBot'taki kayıtları da modele ver (istatistik soruları için)
+        data = await listbot_context()
+        if data:
+            model_text = f"{user_text}\n\n{data}"
+            chain = DATA_CHAIN
 
     try:
         async with keep_alive(update, context):
-            reply_text = await ask_chain(TEXT_CHAIN, get_history(context), model_text)
+            reply_text = await ask_chain(chain, get_history(context), model_text)
     except Exception:
         logger.exception("Hiçbir metin modeli yanıt veremedi")
         await update.message.reply_text("Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.")
         return
 
-    reply_text = await process_table(context, reply_text)
+    reply_text = await process_table(context, reply_text, previous=previous)
     add_to_history(context, "user", user_text)
     add_to_history(context, "assistant", reply_text)
     await send_reply(update, reply_text)
+
+
+# Soru cevaplarken ListBot tablosunun TAMAMI modele verilir.
+# Güvenlik sınırı: tablo bu kadar karakteri aşarsa en eski kayıtlar çıkarılır
+# (yaklaşık 15.000 satır; EVREN DeepSeek 1M token bağlamı bunu rahat taşır).
+DATA_MAX_CHARS = 600_000
+
+# Tablo soruları büyük veri taşıdığı için önce geniş bağlamlı EVREN modeli kullanılır
+DATA_CHAIN = [
+    ("evren", "deepseek-v4.1-flash", 4096),
+    ("groq", "qwen/qwen3.8-27b", 900),
+]
+DATA_CHAIN = [c for c in DATA_CHAIN if c[0] in CLIENTS]
+
+
+def _to_number(x: str):
+    try:
+        return float(str(x).replace(",", ".").strip())
+    except ValueError:
+        return None
+
+
+def read_listbot_all() -> str:
+    """ListBot'un tamamını ve kodla hesaplanmış özetleri metin olarak döndürür."""
+    values = open_listbot().get_all_values()
+    if len(values) < 2:
+        return ""
+    header, rows = values[0], [r for r in values[1:] if any(c.strip() for c in r)]
+    keys = [HEADER_ALIASES.get(h.strip().lower()) for h in header]
+    col = {k: i for i, k in enumerate(keys) if k}
+
+    # Kodla hesaplanan özetler (yapay zekanın toplama hatası yapmaması için)
+    per_day, per_dish = {}, {}
+    for r in rows:
+        def get(k):
+            i = col.get(k)
+            return r[i].strip() if i is not None and i < len(r) else ""
+        qty = _to_number(get("qty")) or 0
+        d, name = get("date"), get("name")
+        cnt, tot = per_day.get(d, (0, 0))
+        per_day[d] = (cnt + 1, tot + qty)
+        per_dish[name] = per_dish.get(name, 0) + qty
+
+    def fmt(n):
+        return str(int(n)) if float(n).is_integer() else str(n)
+
+    def date_key(d):
+        try:
+            return datetime.strptime(d, "%d.%m.%Y")
+        except ValueError:
+            return datetime.min
+
+    day_lines = [f"{d}: {c} satır, toplam {fmt(t)} adet"
+                 for d, (c, t) in sorted(per_day.items(), key=lambda x: date_key(x[0]))]
+    dish_lines = [f"{n}: {fmt(t)}" for n, t in sorted(per_dish.items(), key=lambda x: -x[1])]
+
+    lines = [";".join(c.replace(";", ",") for c in r) for r in rows]
+    dropped = 0
+    while lines and sum(len(l) + 1 for l in lines) > DATA_MAX_CHARS:
+        lines.pop(0)
+        dropped += 1
+
+    parts = [
+        f"TOPLAM KAYIT: {len(rows)} satır, {len(per_day)} gün",
+        "GÜNLÜK ÖZET (kodla hesaplandı):\n" + "\n".join(day_lines),
+        "YEMEK BAZINDA TOPLAM ADET, TÜM ZAMANLAR (kodla hesaplandı):\n" + "\n".join(dish_lines),
+    ]
+    if dropped:
+        parts.append(f"NOT: Boyut sınırı nedeniyle en eski {dropped} satır aşağıdaki listeye eklenmedi "
+                     "(özetler yine de tüm satırları kapsar).")
+    parts.append("TÜM KAYITLAR (';' ile ayrılmış):\n" + ";".join(header) + "\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
+async def listbot_context() -> str:
+    try:
+        table = await asyncio.wait_for(asyncio.to_thread(read_listbot_all), timeout=60)
+    except Exception as e:
+        logger.warning("ListBot verisi okunamadı: %s", e)
+        return ""
+    if not table:
+        return "[Sistem: ListBot tablosunda henüz kayıt yok.]"
+    return (
+        "[Sistem: Aşağıda ListBot tablosunun TAMAMI ve kodla hesaplanmış özetler var. "
+        "Kullanıcı kayıtlarla, yemeklerle, adetlerle, tarihlerle veya istatistiklerle ilgili soru "
+        "sorarsa SADECE bu veriden cevap ver. Hazır özetlerde cevap varsa onları kullan; yoksa "
+        "kayıtlardan dikkatle hesapla. Veri yoksa uydurma, bunu söyle. Soru bununla ilgili "
+        "değilse bu veriyi yok say.]\n\n" + table
+    )
 
 
 # --- Resim mesajları ---
@@ -789,12 +898,12 @@ def main():
             url_path="webhook",
             webhook_url=f"{RENDER_EXTERNAL_URL}/webhook",
             secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
         )
     else:
         # Kendi bilgisayarında test ederken: polling modu
         logger.info("Polling modunda başlatılıyor...")
-        app.run_polling(drop_pending_updates=True)
+        app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
